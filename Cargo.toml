@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cvmbuild-config",
+    "crates/cvmbuild-oci",
+    "crates/cvmbuild-rootfs",
+    "crates/cvmbuild-image",
+    "crates/cvmbuild-cli",
+    "crates/cvmbuild-measure",
+    "crates/cvmbuild-squashfs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Crypto / hashing
+sha2 = "0.10"
+
+# Image assembly
+gptman = "1"
+
+# Serialization
+serde_json = "1"
+
+# HuggingFace model downloads
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Internal crates
+cvmbuild-config = { path = "crates/cvmbuild-config" }
+cvmbuild-oci = { path = "crates/cvmbuild-oci" }
+cvmbuild-rootfs = { path = "crates/cvmbuild-rootfs" }
+cvmbuild-image = { path = "crates/cvmbuild-image" }
+cvmbuild-measure = { path = "crates/cvmbuild-measure" }

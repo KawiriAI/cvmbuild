@@ -1,0 +1,20 @@
+[package]
+name = "cvmbuild-image"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cvmbuild-config = { workspace = true }
+cvmbuild-measure = { workspace = true }
+cvmbuild-squashfs = { path = "../cvmbuild-squashfs" }
+gptman = { workspace = true }
+sha2 = { workspace = true }
+hex = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
