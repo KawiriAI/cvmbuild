@@ -63,6 +63,21 @@ pub struct ImageConfig {
     /// Required when `base_image` is set.
     #[serde(default)]
     pub base_image_dockerfile: Option<String>,
+    /// Pin to a specific kawa release. cvmbuild fetches
+    /// `kawa-v{version}-linux-x86_64.tar.gz` from the KawiriAI/kawiri
+    /// release matching this tag and stages the binary into the
+    /// base-image build context (next to `base_image_dockerfile`).
+    /// Required for reproducible measurements — kawa is COPY'd into
+    /// the rootfs and its bytes affect SNP/TDX measurements.
+    #[serde(default)]
+    pub kawa_version: Option<String>,
+    /// Pin to a specific kawiri OVMF release. cvmbuild fetches
+    /// `ovmf-v{version}.tar.gz` from the KawiriAI/kawiri release matching
+    /// this tag and uses the resulting directory as the OVMF source for
+    /// measurement. Overrides whatever `--ovmf-dir` would otherwise default
+    /// to (an explicit `--ovmf-dir`/`OVMF_DIR` still wins).
+    #[serde(default)]
+    pub ovmf_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

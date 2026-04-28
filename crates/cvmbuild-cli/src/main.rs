@@ -1,4 +1,5 @@
 mod cache;
+mod kawiri_cache;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -193,11 +194,18 @@ fn run(cli: Cli) -> Result<()> {
     let (image_dir, config_path) = resolve_config(&cli.image_dir)?;
     let mut config = cvmbuild_config::Config::load(&config_path).context("loading config")?;
 
-    // Resolve OVMF filenames against --ovmf-dir (or OVMF_DIR env, or default)
+    // Resolve OVMF filenames against:
+    //   1. --ovmf-dir / OVMF_DIR (explicit operator override)
+    //   2. cached cvm.toml [image].ovmf_version pin (downloads release if missing)
+    //   3. config file directory (backwards compat)
     if let Some(ref ovmf_dir) = cli.ovmf_dir {
         config.resolve_ovmf(ovmf_dir);
+    } else if let Some(version) = config.image.ovmf_version.clone() {
+        let dir = kawiri_cache::ensure_ovmf(&version)
+            .with_context(|| format!("resolving pinned ovmf v{version} from cache"))?;
+        tracing::info!("Using cached ovmf v{version} at {}", dir.display());
+        config.resolve_ovmf(&dir);
     } else {
-        // Fallback: resolve relative to config file directory (backwards compat)
         let base = config_path.parent().unwrap_or(std::path::Path::new("."));
         config.resolve_ovmf(base);
     }
@@ -334,6 +342,52 @@ fn cmd_checks(config: &cvmbuild_config::Config) -> Result<()> {
         catalog::STRUCTURAL_CHECKS.len() + active_set.len(),
     );
 
+    Ok(())
+}
+
+/// Stage the pinned kawa release binary next to the base-image Dockerfile so
+/// `COPY kawa /usr/local/bin/kawa` picks up the exact released bytes.
+///
+/// The cache (under /var/lib/kawiri/kawa/<version>/) holds the canonical copy;
+/// we copy from there into the build context. We always overwrite to avoid a
+/// stale binary from a previous build sneaking into a new measurement.
+fn stage_kawa(
+    config: &cvmbuild_config::Config,
+    image_dir: &std::path::Path,
+    version: &str,
+) -> Result<()> {
+    let dockerfile_rel = config
+        .image
+        .base_image_dockerfile
+        .as_deref()
+        .context("kawa_version is set but base_image_dockerfile is not — cvmbuild needs to know where to stage the kawa binary")?;
+
+    let build_context = if let Some(ref ctx) = config.image.context {
+        let p = std::path::Path::new(ctx);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            image_dir.join(ctx)
+        }
+    } else {
+        image_dir.to_path_buf()
+    };
+    let dockerfile_path = build_context.join(dockerfile_rel);
+    let staging_dir = dockerfile_path
+        .parent()
+        .context("base_image_dockerfile has no parent directory")?;
+    let target = staging_dir.join("kawa");
+
+    let cached = kawiri_cache::ensure_kawa(version)?;
+    std::fs::copy(&cached, &target)
+        .with_context(|| format!("staging kawa binary at {}", target.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+    tracing::info!(
+        "Staged kawa v{version} → {} (from {})",
+        target.display(),
+        cached.display()
+    );
     Ok(())
 }
 
@@ -650,6 +704,15 @@ fn cmd_build(
     } else {
         check_docker()?;
 
+        // Stage the pinned kawa binary into the base-image build context so the
+        // base Dockerfile's `COPY kawa /usr/local/bin/kawa` picks up the exact
+        // released bytes — kawa is part of the rootfs and its hash feeds into
+        // every SNP/TDX measurement, so the version pin in cvm.toml MUST be
+        // what actually gets baked in.
+        if let Some(ref version) = config.image.kawa_version {
+            stage_kawa(config, image_dir, version)?;
+        }
+
         // Resolve APT_MIRROR: use env var if set, otherwise start embedded cache proxy.
         // Caches to /var/cache/cvmbuild/apt/. Docker reaches it via --network=host.
         let (apt_mirror, _apt_proxy) = if std::env::var("APT_MIRROR")
@@ -753,7 +816,15 @@ fn cmd_build(
                         cmd.args(["--cache-from", &from, "--cache-to", &to]);
                     }
                 }
-                cmd.arg(build_context.to_string_lossy().to_string());
+                // The base-image Dockerfile is self-contained — its only inputs are
+                // its own directory (the kawa binary staged by stage_kawa, plus heredoc
+                // content). Use the dockerfile's parent as the docker build context so
+                // `COPY kawa /usr/local/bin/kawa` resolves to the staged binary instead
+                // of looking for it at the global config context root.
+                let base_build_context = df_path
+                    .parent()
+                    .unwrap_or(&build_context);
+                cmd.arg(base_build_context.to_string_lossy().to_string());
                 let status = cmd.status().context("failed to build base image")?;
                 if !status.success() {
                     anyhow::bail!("base image build failed for '{}'", base_image);
