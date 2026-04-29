@@ -172,8 +172,8 @@ mod tests {
     #[test]
     fn write_region_with_extend_adds_pages_and_chunks() {
         let mut data = vec![0u8; 0x1000];
-        for i in 0..data.len() {
-            data[i] = ((i * 7) & 0xFF) as u8;
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = ((i * 7) & 0xFF) as u8;
         }
 
         let mut ctx = LaunchContext::new();

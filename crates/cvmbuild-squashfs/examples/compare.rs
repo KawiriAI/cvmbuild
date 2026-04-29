@@ -1,4 +1,4 @@
-/// Compare two squashfs images by decompressing their inode and directory tables.
+//! Compare two squashfs images by decompressing their inode and directory tables.
 
 fn read_u16(d: &[u8], off: usize) -> u16 {
     u16::from_le_bytes(d[off..off + 2].try_into().unwrap())

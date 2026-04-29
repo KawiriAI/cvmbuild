@@ -1,4 +1,4 @@
-/// Count inode types across the full inode table of a squashfs image.
+//! Count inode types across the full inode table of a squashfs image.
 
 fn read_u16(d: &[u8], off: usize) -> u16 {
     u16::from_le_bytes(d[off..off + 2].try_into().unwrap())
@@ -99,7 +99,7 @@ fn parse_inodes(inode_data: &[u8]) -> InodeStats {
                     fsize / block_size
                 } else {
                     // No fragment: ceil division
-                    (fsize + block_size - 1) / block_size
+                    fsize.div_ceil(block_size)
                 };
                 off += 32 + nblocks as usize * 4;
             }
@@ -122,7 +122,7 @@ fn parse_inodes(inode_data: &[u8]) -> InodeStats {
                 } else if frag != 0xFFFFFFFF {
                     fsize / block_size
                 } else {
-                    (fsize + block_size - 1) / block_size
+                    fsize.div_ceil(block_size)
                 };
                 off += 56 + nblocks as usize * 4;
             }

@@ -821,9 +821,7 @@ fn cmd_build(
                 // content). Use the dockerfile's parent as the docker build context so
                 // `COPY kawa /usr/local/bin/kawa` resolves to the staged binary instead
                 // of looking for it at the global config context root.
-                let base_build_context = df_path
-                    .parent()
-                    .unwrap_or(&build_context);
+                let base_build_context = df_path.parent().unwrap_or(&build_context);
                 cmd.arg(base_build_context.to_string_lossy().to_string());
                 let status = cmd.status().context("failed to build base image")?;
                 if !status.success() {

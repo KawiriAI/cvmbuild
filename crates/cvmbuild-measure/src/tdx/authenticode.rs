@@ -157,8 +157,8 @@ mod tests {
         pe[sec_off + 20..sec_off + 24].copy_from_slice(&0x200u32.to_le_bytes()); // PointerToRawData
 
         // Fill section with recognizable data
-        for i in 0x200..0x400 {
-            pe[i] = ((i * 3 + 7) & 0xFF) as u8;
+        for (i, byte) in pe.iter_mut().enumerate().take(0x400).skip(0x200) {
+            *byte = ((i * 3 + 7) & 0xFF) as u8;
         }
 
         pe
