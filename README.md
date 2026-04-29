@@ -99,7 +99,7 @@ ovmf_file = "OVMF.fd"     # resolved relative to OVMF_DIR
 guest_features = 1         # SEV_FEATURES bitmask (0x1 = SnpActive)
 
 [manifest.tdx]
-ovmf_file = "OVMF-TDX.fd" # resolved relative to OVMF_DIR
+ovmf_file = "OVMF_TDX.fd" # resolved relative to OVMF_DIR
 ```
 
 ## Commands

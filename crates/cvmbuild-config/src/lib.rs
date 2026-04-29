@@ -278,7 +278,7 @@ impl Default for SnpManifestConfig {
 /// Intel TDX specific manifest configuration.
 #[derive(Debug, Default, Deserialize)]
 pub struct TdxManifestConfig {
-    /// OVMF/TDVF firmware filename (e.g. "OVMF-TDX.fd"). Resolved against --ovmf-dir at build time.
+    /// OVMF/TDVF firmware filename (e.g. "OVMF_TDX.fd"). Resolved against --ovmf-dir at build time.
     /// For backwards compatibility, full paths are also accepted.
     #[serde(default, alias = "ovmf_path")]
     pub ovmf_file: Option<String>,
