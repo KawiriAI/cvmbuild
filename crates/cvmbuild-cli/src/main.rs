@@ -1325,7 +1325,7 @@ fn cmd_boot_cmd(opts: &BootCmdOpts<'_>) -> Result<()> {
     // Validate QEMU binary exists
     if !std::path::Path::new(opts.qemu_bin).exists() {
         anyhow::bail!(
-            "QEMU binary not found: {} — run 'just qemu' to build it",
+            "QEMU binary not found: {} — pass --qemu-bin <path> or install matcha-provisioned QEMU",
             opts.qemu_bin
         );
     }
