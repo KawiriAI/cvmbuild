@@ -750,15 +750,18 @@ fn cmd_build(
             }
         };
 
-        // Auto-build base image if configured and missing
+        // (Re)build the base image whenever cvm.toml configures one.
+        //
+        // We used to skip this when `docker image inspect <base_image>` succeeded,
+        // but that meant a stale cvm-base:latest from a previous build (with a
+        // different kawa binary, e.g. production vs kawa-mocktee) would silently
+        // get reused — the COPY kawa layer never re-runs because docker doesn't
+        // know its inputs changed. Always invoke docker buildx instead and let
+        // buildkit's content-addressed layer cache keep it cheap: unchanged
+        // inputs → seconds, every layer cached; changed kawa → invalidates from
+        // COPY kawa onwards, still fast.
         if let Some(ref base_image) = config.image.base_image {
-            let inspect = std::process::Command::new("docker")
-                .args(["image", "inspect", base_image])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            let exists = inspect.map(|s| s.success()).unwrap_or(false);
-            if !exists {
+            {
                 let base_dockerfile = match config.image.base_image_dockerfile.as_deref() {
                     Some(d) => d,
                     None => anyhow::bail!(
