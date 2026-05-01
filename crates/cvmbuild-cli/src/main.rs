@@ -402,77 +402,6 @@ fn stage_kawa(
     Ok(())
 }
 
-/// Embedded dracut module — staged into the base-image build context so
-/// the cvm-base Dockerfile can `COPY` it into `/usr/lib/dracut/modules.d/`.
-/// We ship the module from cvmbuild rather than asking each kcvm recipe
-/// to maintain shell scripts: bumping cvmbuild updates the verity
-/// activation logic everywhere automatically, which mirrors how
-/// `verity-activate.py` and the verity-disk service units are generated
-/// from cvmbuild's Rust code today.
-const DRACUT_MODULE_SETUP: &str =
-    include_str!("../assets/dracut/module-setup.sh");
-const DRACUT_VERITY_ROOT: &str =
-    include_str!("../assets/dracut/verity-root.sh");
-const DRACUT_DM_BLKID_RULES: &str =
-    include_str!("../assets/dracut/56-dm-blkid.rules");
-
-/// Stage the cvmbuild dracut module into the docker build context.
-///
-/// The cvm-base Dockerfile (`COPY dracut-modules/90verity-cvm/ ...`)
-/// expects the module to live at `<base-image-dir>/dracut-modules/90verity-cvm/`,
-/// alongside `kawa`. The bucket-poll prune logic in teehost skips
-/// directories, so a staged subdir survives between builds.
-fn stage_dracut_modules(
-    config: &cvmbuild_config::Config,
-    image_dir: &std::path::Path,
-) -> Result<()> {
-    let dockerfile_rel = config
-        .image
-        .base_image_dockerfile
-        .as_deref()
-        .context("base_image_dockerfile required to stage dracut modules")?;
-
-    let build_context = if let Some(ref ctx) = config.image.context {
-        let p = std::path::Path::new(ctx);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            image_dir.join(ctx)
-        }
-    } else {
-        image_dir.to_path_buf()
-    };
-    let dockerfile_path = build_context.join(dockerfile_rel);
-    let staging_dir = dockerfile_path
-        .parent()
-        .context("base_image_dockerfile has no parent directory")?;
-    let module_dir = staging_dir.join("dracut-modules").join("90verity-cvm");
-    std::fs::create_dir_all(&module_dir)
-        .with_context(|| format!("creating {}", module_dir.display()))?;
-
-    use std::os::unix::fs::PermissionsExt;
-
-    let setup = module_dir.join("module-setup.sh");
-    std::fs::write(&setup, DRACUT_MODULE_SETUP)
-        .with_context(|| format!("writing {}", setup.display()))?;
-    std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755))?;
-
-    let verity = module_dir.join("verity-root.sh");
-    std::fs::write(&verity, DRACUT_VERITY_ROOT)
-        .with_context(|| format!("writing {}", verity.display()))?;
-    std::fs::set_permissions(&verity, std::fs::Permissions::from_mode(0o755))?;
-
-    let rules = module_dir.join("56-dm-blkid.rules");
-    std::fs::write(&rules, DRACUT_DM_BLKID_RULES)
-        .with_context(|| format!("writing {}", rules.display()))?;
-
-    tracing::info!(
-        "Staged dracut module → {} (3 files)",
-        module_dir.display()
-    );
-    Ok(())
-}
-
 /// Check that docker is available.
 fn check_docker() -> Result<()> {
     let ok = std::process::Command::new("docker")
@@ -793,14 +722,6 @@ fn cmd_build(
         // what actually gets baked in.
         if let Some(ref version) = config.image.kawa_version {
             stage_kawa(config, image_dir, version)?;
-        }
-
-        // Stage the dracut module into base-image/dracut-modules/. The
-        // cvm-base Dockerfile copies it into /usr/lib/dracut/modules.d/
-        // so dracut --add verity-cvm can pick it up at base-image build
-        // time. Only meaningful when there's a base image to build.
-        if config.image.base_image_dockerfile.is_some() {
-            stage_dracut_modules(config, image_dir)?;
         }
 
         // Resolve APT_MIRROR: use env var if set, otherwise start embedded cache proxy.
