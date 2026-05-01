@@ -384,7 +384,8 @@ impl RootfsBuilder {
     /// so dpkg/apt never run again — these logs serve no purpose in a sealed
     /// CVM image.
     fn purge_build_logs(&self) -> Result<()> {
-        let targets = [
+        // apt/dpkg logs — wallclock embedded in contents.
+        let log_targets = [
             "var/log/apt/history.log",
             "var/log/apt/term.log",
             "var/log/apt/eipp.log.xz",
@@ -392,16 +393,35 @@ impl RootfsBuilder {
             "var/log/alternatives.log",
             "var/log/bootstrap.log",
         ];
+        // ld.so cache: regenerated post-install by ldconfig with non-deterministic
+        // library scan ordering (one library, one binary differing by mtime
+        // skew, and you get a different byte string). Regenerated on demand
+        // at first boot, so safe to remove.
+        //
+        // /etc/apt/sources.list: cvmbuild's embedded apt-cache proxy binds to
+        // an ephemeral port at startup (`AptCacheProxy::start`), and that
+        // port number ends up baked into sources.list via ${APT_MIRROR}.
+        // Two consecutive cold-cache builds on the same host produce
+        // different ports → different sources.list → different rootfs_roothash.
+        // Apt itself is removed from sealed CVM images (per cvm.toml security
+        // policy), so sources.list is dead weight at runtime — wipe it.
+        let cache_targets = [
+            "etc/ld.so.cache",
+            "var/cache/ldconfig/aux-cache",
+            "etc/apt/sources.list",
+        ];
         let mut removed = 0;
-        for rel in targets {
+        for rel in log_targets.iter().chain(cache_targets.iter()) {
             let p = self.rootfs.join(rel);
             if p.exists() {
                 std::fs::remove_file(&p)
-                    .with_context(|| format!("removing build log {}", p.display()))?;
+                    .with_context(|| format!("removing {}", p.display()))?;
                 removed += 1;
             }
         }
-        tracing::info!("Purged {removed} build-time log file(s) for reproducibility");
+        tracing::info!(
+            "Purged {removed} non-reproducible file(s) (apt/dpkg logs + ldconfig caches)"
+        );
         Ok(())
     }
 

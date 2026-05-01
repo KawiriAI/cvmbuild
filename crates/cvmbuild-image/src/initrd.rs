@@ -4,7 +4,7 @@
 //! We extract the base initrd from the container's /boot/ and prepend our
 //! verity activation overlay.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use crate::cpio::CpioBuilder;
 use crate::squashfs::sha256_file;
 
-/// Build the final initrd: overlay CPIO + base initrd.
+/// Build the final initrd: overlay CPIO + (deterministic) base initrd.
 ///
 /// Returns (output_path, sha256).
 pub fn build_initrd(
@@ -22,7 +22,21 @@ pub fn build_initrd(
 ) -> Result<(PathBuf, String)> {
     let overlay = build_overlay_cpio(config)?;
 
-    // Concatenate: overlay CPIO first (uncompressed), then base initrd (compressed).
+    // Read the base initrd produced by initramfs-tools inside the docker
+    // build. It's typically structured as:
+    //   - 0..N: uncompressed CPIO (kernel modules + firmware + early boot)
+    //   - N..end: zstd-compressed CPIO (rest of initramfs userland)
+    //
+    // Both segments embed inode numbers and mtimes from the docker build's
+    // ephemeral filesystem, so they differ between cold-cache builds — the
+    // exact reproducibility leak that drove the rootfs hash fix elsewhere
+    // in cvmbuild. Rewrite both to zero those fields before concatenating.
+    let base = std::fs::read(base_initrd)
+        .with_context(|| format!("opening {}", base_initrd.display()))?;
+    let deterministic_base = make_initrd_deterministic(&base)
+        .context("rewriting base initrd to be deterministic")?;
+
+    // Concatenate: overlay CPIO first (uncompressed), then base initrd.
     //
     // The Linux kernel processes concatenated CPIOs in order. Putting the
     // uncompressed overlay first avoids "invalid magic at start of compressed
@@ -35,25 +49,127 @@ pub fn build_initrd(
     // verity services, udev rules) that don't exist in the base.
     let mut out = std::fs::File::create(output_path)
         .with_context(|| format!("creating {}", output_path.display()))?;
-
-    // Write overlay CPIO first (uncompressed, small)
     out.write_all(&overlay).context("writing overlay CPIO")?;
-
-    // Stream the base initrd second (compressed, large)
-    let mut base = std::fs::File::open(base_initrd)
-        .with_context(|| format!("opening {}", base_initrd.display()))?;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = base.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        out.write_all(&buf[..n])?;
-    }
+    out.write_all(&deterministic_base)
+        .context("writing deterministic base initrd")?;
     drop(out);
 
     let hash = sha256_file(output_path)?;
     Ok((output_path.to_path_buf(), hash))
+}
+
+/// Walk a CPIO new-c byte stream and zero the per-entry inode + mtime
+/// fields in-place. Returns the rewritten buffer (same length, ino + mtime
+/// fields replaced with `00000000`). nlink is left alone — link-count
+/// differences would change tarball semantics.
+///
+/// CPIO new-c header layout (every field is 8-byte ASCII hex):
+///   off  field           note
+///   0    "070701"         (6-byte magic, NOT 8 hex)
+///   6    c_ino            ← ZERO
+///   14   c_mode
+///   22   c_uid
+///   30   c_gid
+///   38   c_nlink
+///   46   c_mtime          ← ZERO
+///   54   c_filesize
+///   62   c_devmajor
+///   70   c_devminor
+///   78   c_rdevmajor
+///   86   c_rdevminor
+///   94   c_namesize
+///   102  c_check
+///   110  c_name (length c_namesize, NUL-terminated)
+///        + 4-byte padding to align c_data
+///   ?    c_data (c_filesize bytes)
+///        + 4-byte padding to align next header
+fn rewrite_cpio_dets(buf: &mut [u8]) -> Result<()> {
+    const ZERO_HEX: &[u8] = b"00000000";
+    let mut pos = 0;
+    while pos + 110 <= buf.len() {
+        if &buf[pos..pos + 6] != b"070701" {
+            // Could be padding before next archive — skip null bytes.
+            if buf[pos] == 0 {
+                pos += 1;
+                continue;
+            }
+            // Not CPIO header and not padding — stop walking.
+            break;
+        }
+        let namesize = parse_hex8(&buf[pos + 94..pos + 102])
+            .context("parsing CPIO c_namesize")?;
+        let filesize = parse_hex8(&buf[pos + 54..pos + 62])
+            .context("parsing CPIO c_filesize")?;
+        // Zero the two non-deterministic fields.
+        buf[pos + 6..pos + 14].copy_from_slice(ZERO_HEX); // c_ino
+        buf[pos + 46..pos + 54].copy_from_slice(ZERO_HEX); // c_mtime
+
+        // Detect TRAILER!!! and stop — anything past it is concatenation
+        // padding for the next archive segment, which the caller handles.
+        let name_start = pos + 110;
+        let name_end = name_start + namesize as usize;
+        if name_end > buf.len() {
+            anyhow::bail!("CPIO name overruns buffer at offset {pos}");
+        }
+        let name = &buf[name_start..name_end - 1];
+        let name_padded = (name_end + 3) & !3;
+        let data_end = name_padded + filesize as usize;
+        let data_padded = (data_end + 3) & !3;
+        if data_padded > buf.len() {
+            anyhow::bail!("CPIO data overruns buffer at offset {pos}");
+        }
+        pos = data_padded;
+        if name == b"TRAILER!!!" {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn parse_hex8(s: &[u8]) -> Result<u32> {
+    let s = std::str::from_utf8(s).context("CPIO field not ASCII")?;
+    u32::from_str_radix(s, 16).context("CPIO field not hex")
+}
+
+/// Find the byte offset where the uncompressed CPIO segments end and a
+/// zstd-compressed segment begins (zstd magic `28 b5 2f fd`). Returns
+/// `None` if no zstd segment is found.
+fn find_zstd_offset(buf: &[u8]) -> Option<usize> {
+    const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
+    buf.windows(4)
+        .position(|w| w == ZSTD_MAGIC)
+        .map(|i| i)
+}
+
+/// Rewrite a base initrd to remove non-deterministic fields:
+///   1. Zero inode + mtime in every uncompressed CPIO entry header.
+///   2. Decompress the trailing zstd segment, do the same, recompress
+///      with a fixed level (no embedded mtime).
+fn make_initrd_deterministic(base: &[u8]) -> Result<Vec<u8>> {
+    let zstd_off = find_zstd_offset(base);
+
+    // Phase 1: rewrite the leading uncompressed CPIO portion.
+    let mut head = match zstd_off {
+        Some(off) => base[..off].to_vec(),
+        None => base.to_vec(),
+    };
+    rewrite_cpio_dets(&mut head)?;
+
+    // Phase 2: decompress, rewrite, recompress the trailing zstd segment.
+    if let Some(off) = zstd_off {
+        let compressed = &base[off..];
+        let mut decoded = zstd::stream::decode_all(compressed)
+            .context("decoding zstd-compressed initramfs segment")?;
+        rewrite_cpio_dets(&mut decoded)?;
+        // Recompress at level 19 (initramfs-tools uses ~19 by default for
+        // size). Level is part of the algorithm, not a "build setting", so
+        // identical input + level → identical output.
+        let recompressed = zstd::stream::encode_all(decoded.as_slice(), 19)
+            .context("re-encoding zstd-compressed initramfs segment")?;
+        head.extend_from_slice(&recompressed);
+    }
+
+    Ok(head)
 }
 
 /// Build the overlay CPIO containing verity activation infrastructure.
