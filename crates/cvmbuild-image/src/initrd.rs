@@ -131,14 +131,57 @@ fn parse_hex8(s: &[u8]) -> Result<u32> {
     u32::from_str_radix(s, 16).context("CPIO field not hex")
 }
 
-/// Find the byte offset where the uncompressed CPIO segments end and a
-/// zstd-compressed segment begins (zstd magic `28 b5 2f fd`). Returns
-/// `None` if no zstd segment is found.
+/// Find the byte offset where the uncompressed CPIO segment ends and the
+/// trailing zstd-compressed segment begins. Returns `None` if no
+/// compressed segment is appended (some images ship the entire initramfs
+/// uncompressed).
+///
+/// We can't naively grep the buffer for the zstd magic — those four
+/// bytes (`28 b5 2f fd`) can occur as random data inside CPIO file
+/// contents. Walk CPIO headers until we hit a `TRAILER!!!`, skip any
+/// 4-byte alignment padding, and check for the zstd magic at exactly
+/// that offset.
 fn find_zstd_offset(buf: &[u8]) -> Option<usize> {
     const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
-    buf.windows(4)
-        .position(|w| w == ZSTD_MAGIC)
-        .map(|i| i)
+    let mut pos = 0;
+    while pos + 110 <= buf.len() {
+        // Skip any leading null padding between concatenated archives.
+        if buf[pos] == 0 {
+            pos += 1;
+            continue;
+        }
+        if &buf[pos..pos + 6] != b"070701" {
+            return None;
+        }
+        let namesize = parse_hex8(&buf[pos + 94..pos + 102]).ok()?;
+        let filesize = parse_hex8(&buf[pos + 54..pos + 62]).ok()?;
+        let name_start = pos + 110;
+        let name_end = name_start + namesize as usize;
+        if name_end > buf.len() {
+            return None;
+        }
+        let name = &buf[name_start..name_end - 1];
+        let name_padded = (name_end + 3) & !3;
+        let data_end = name_padded + filesize as usize;
+        let data_padded = (data_end + 3) & !3;
+        if data_padded > buf.len() {
+            return None;
+        }
+        pos = data_padded;
+        if name == b"TRAILER!!!" {
+            // Skip any null alignment past the trailer until we hit a
+            // non-zero byte; that's where the next segment begins.
+            while pos < buf.len() && buf[pos] == 0 {
+                pos += 1;
+            }
+            if pos + 4 <= buf.len() && &buf[pos..pos + 4] == ZSTD_MAGIC {
+                return Some(pos);
+            }
+            // Could be another uncompressed CPIO archive concatenated.
+            // Don't return Some here — keep walking.
+        }
+    }
+    None
 }
 
 /// Rewrite a base initrd to remove non-deterministic fields:
