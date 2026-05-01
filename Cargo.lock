@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "cvmbuild-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "cvmbuild-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "cvmbuild-image"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cvmbuild-config",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "cvmbuild-measure"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "cvmbuild-oci"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "tracing",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "cvmbuild-rootfs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cvmbuild-config",
