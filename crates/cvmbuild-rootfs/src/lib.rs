@@ -405,10 +405,17 @@ impl RootfsBuilder {
         // different ports → different sources.list → different rootfs_roothash.
         // Apt itself is removed from sealed CVM images (per cvm.toml security
         // policy), so sources.list is dead weight at runtime — wipe it.
+        //
+        // /var/lib/dbus/machine-id: D-Bus generates its own random 128-bit
+        // UUID at install time. We already blank /etc/machine-id in the
+        // base-image Dockerfile, but the dbus copy is independent and gets
+        // a different UUID every cold-cache build. systemd recreates it
+        // (or symlinks to /etc/machine-id) at first boot, so safe to wipe.
         let cache_targets = [
             "etc/ld.so.cache",
             "var/cache/ldconfig/aux-cache",
             "etc/apt/sources.list",
+            "var/lib/dbus/machine-id",
         ];
         let mut removed = 0;
         for rel in log_targets.iter().chain(cache_targets.iter()) {

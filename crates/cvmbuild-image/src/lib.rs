@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use cvmbuild_config::Config;
 
-pub mod cpio;
 pub mod ext4;
 pub mod gpt;
 pub mod initrd;
