@@ -32,6 +32,7 @@ impl RootfsBuilder {
         self.strip_suid_sgid()?;
         self.rewrite_shells_to_nologin()?;
         self.write_tee_modules_load()?;
+        self.purge_build_logs()?;
         self.apply_hardening(config)?;
         Ok(())
     }
@@ -372,6 +373,37 @@ impl RootfsBuilder {
     // -----------------------------------------------------------------------
     // Existing hardening
     // -----------------------------------------------------------------------
+
+    /// Remove build-time log files whose contents embed wallclock timestamps
+    /// from the docker build. Without this, two hosts building the same image
+    /// produce different rootfs hashes (and therefore different SNP launch
+    /// digests) purely because apt/dpkg ran at different seconds.
+    ///
+    /// Files cleared: /var/log/{apt/{history,term,eipp.log.xz},dpkg.log,
+    /// alternatives.log,bootstrap.log}. The rootfs is read-only at runtime
+    /// so dpkg/apt never run again — these logs serve no purpose in a sealed
+    /// CVM image.
+    fn purge_build_logs(&self) -> Result<()> {
+        let targets = [
+            "var/log/apt/history.log",
+            "var/log/apt/term.log",
+            "var/log/apt/eipp.log.xz",
+            "var/log/dpkg.log",
+            "var/log/alternatives.log",
+            "var/log/bootstrap.log",
+        ];
+        let mut removed = 0;
+        for rel in targets {
+            let p = self.rootfs.join(rel);
+            if p.exists() {
+                std::fs::remove_file(&p)
+                    .with_context(|| format!("removing build log {}", p.display()))?;
+                removed += 1;
+            }
+        }
+        tracing::info!("Purged {removed} build-time log file(s) for reproducibility");
+        Ok(())
+    }
 
     /// Apply security hardening: sysctl, journald config, etc.
     fn apply_hardening(&self, config: &Config) -> Result<()> {
