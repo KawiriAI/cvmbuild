@@ -378,16 +378,27 @@ fn stage_kawa(
         .context("base_image_dockerfile has no parent directory")?;
     let target = staging_dir.join("kawa");
 
-    let cached = kawiri_cache::ensure_kawa(version)?;
+    let variant = config.image.kawa_variant.as_deref();
+    let cached = kawiri_cache::ensure_kawa(version, variant)?;
     std::fs::copy(&cached, &target)
         .with_context(|| format!("staging kawa binary at {}", target.display()))?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+    let label = match variant {
+        Some("mock") => "kawa-mocktee",
+        _ => "kawa",
+    };
     tracing::info!(
-        "Staged kawa v{version} → {} (from {})",
+        "Staged {label} v{version} → {} (from {})",
         target.display(),
         cached.display()
     );
+    if variant == Some("mock") {
+        tracing::warn!(
+            "image is being built with kawa-mocktee — clients cannot attest \
+             this CVM with a real validator. For testing only."
+        );
+    }
     Ok(())
 }
 

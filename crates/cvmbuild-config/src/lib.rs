@@ -71,6 +71,20 @@ pub struct ImageConfig {
     /// the rootfs and its bytes affect SNP/TDX measurements.
     #[serde(default)]
     pub kawa_version: Option<String>,
+    /// Which kawa flavor to fetch from the release.
+    ///
+    /// - `None` / `"production"`: `kawa-v{version}-…` — reads real
+    ///   attestation from `/sys/kernel/config/tsm/report`. Use this for
+    ///   any image you intend clients to actually attest against.
+    /// - `"mock"`: `kawa-mocktee-v{version}-…` — returns deterministic
+    ///   fake reports. Compile-time gated, used for e2e protocol testing
+    ///   without TEE hardware. **Images built with this variant cannot
+    ///   be trusted as CVMs** — clients running real konnect will reject
+    ///   them, and the operator must explicitly configure konnect with
+    ///   a mock validator to make the handshake complete. Never publish
+    ///   such an image to production clients.
+    #[serde(default)]
+    pub kawa_variant: Option<String>,
     /// Pin to a specific kawiri OVMF release. cvmbuild fetches
     /// `ovmf-v{version}.tar.gz` from the KawiriAI/kawiri release matching
     /// this tag and uses the resulting directory as the OVMF source for

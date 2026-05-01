@@ -53,21 +53,35 @@ fn is_writable(p: &Path) -> bool {
 }
 
 /// Ensure the kawa binary for `version` is present in the cache.
+///
+/// `variant` selects the release artifact:
+/// - `None` / `Some("production")` → `kawa-v{ver}-…`, cached at `<root>/kawa/<ver>/`
+/// - `Some("mock")` → `kawa-mocktee-v{ver}-…`, cached at `<root>/kawa/<ver>-mock/`
+///   (separate path so production and mock builds never collide).
+///
 /// Returns the absolute path to the binary.
-pub fn ensure_kawa(version: &str) -> Result<PathBuf> {
-    let dir = cache_root()?.join("kawa").join(version);
+pub fn ensure_kawa(version: &str, variant: Option<&str>) -> Result<PathBuf> {
+    let (subdir_suffix, asset_prefix, label) = match variant {
+        Some("mock") => ("-mock", "kawa-mocktee", "kawa-mocktee"),
+        None | Some("production") => ("", "kawa", "kawa"),
+        Some(other) => anyhow::bail!(
+            "unknown kawa_variant '{other}' — expected 'production' or 'mock'"
+        ),
+    };
+    let dir_name = format!("{version}{subdir_suffix}");
+    let dir = cache_root()?.join("kawa").join(&dir_name);
     let bin = dir.join("kawa");
     if bin.is_file() {
-        tracing::debug!("kawa v{version} cached at {}", bin.display());
+        tracing::debug!("{label} v{version} cached at {}", bin.display());
         return Ok(bin);
     }
 
-    let asset = format!("kawa-v{version}-linux-x86_64.tar.gz");
+    let asset = format!("{asset_prefix}-v{version}-linux-x86_64.tar.gz");
     let url = format!("https://github.com/{KAWIRI_REPO}/releases/download/kawa-v{version}/{asset}");
 
-    tracing::info!("Downloading kawa v{version} → {}", dir.display());
+    tracing::info!("Downloading {label} v{version} → {}", dir.display());
     download_release(&url, &dir)
-        .with_context(|| format!("downloading kawa v{version} from {url}"))?;
+        .with_context(|| format!("downloading {label} v{version} from {url}"))?;
 
     // Release tarball ships the binary as `kawa-bin`. Rename to `kawa` so the
     // base-image Dockerfile's `COPY kawa /usr/local/bin/kawa` works directly
