@@ -402,6 +402,164 @@ fn stage_kawa(
     Ok(())
 }
 
+/// Rewrite a Dockerfile so any `RUN` block that uses apt gets the
+/// apt-mirror secret mount and re-stamps `/etc/apt/sources.list` with this
+/// build's proxy URL before running its original command. Returns the path
+/// to the rewritten file (next to the original in `output_dir`); the source
+/// Dockerfile on disk is never modified.
+///
+/// Why we need this: cvm-base writes `/etc/apt/sources.list` pointing at
+/// the proxy URL active at cvm-base build time. BuildKit caches that layer
+/// (the secret-mount refactor on cvm-base keeps the layer hash stable
+/// across runs even when the proxy port changes — see the
+/// apt_mirror_secret comment in `cmd_build`). But the *content* of the
+/// cached layer still has the original port baked into the file. Any
+/// child image that inherits cvm-base and runs `apt-get update` in a
+/// later cvmbuild session connects to a port that's long gone.
+///
+/// The rewriter prepends each apt-using RUN with the current build's
+/// secret + a sed pin so the file is corrected just-in-time. Image
+/// Dockerfiles stay clean — authors write plain `RUN apt-get install ...`
+/// and don't think about secrets.
+///
+/// Skipping rules:
+///   - RUNs that already declare `id=apt_mirror` (the cvm-base / cvm-gpu-base
+///     Dockerfiles do this themselves and are written to handle it correctly)
+///   - RUNs whose body doesn't reference `apt-get` or `apt ` as a token
+fn rewrite_dockerfile_for_apt(input: &std::path::Path, output_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let content = std::fs::read_to_string(input)
+        .with_context(|| format!("reading {}", input.display()))?;
+    let rewritten = rewrite_apt_runs(&content);
+    let output = output_dir.join("Dockerfile.rewritten");
+    std::fs::write(&output, rewritten.as_bytes())
+        .with_context(|| format!("writing {}", output.display()))?;
+    Ok(output)
+}
+
+/// Pure transformation. Public-by-module-default for the unit test below.
+fn rewrite_apt_runs(input: &str) -> String {
+    // Prefix injected after `RUN ` for apt-using blocks. Indentation is added
+    // per-call to match whatever indent the RUN had (usually none).
+    //
+    // The sed pattern matches the host:port portion of a deb line and replaces
+    // it with the secret value, leaving the path (snapshot date + suite +
+    // components) intact:
+    //   deb [opts] http://OLD-HOST/ubuntu/<snap> resolute main ...
+    //                       ^^^^^^^^^^^^^^^^^^^^^^
+    //                       this part replaced
+    const PREFIX: &str = "--mount=type=secret,id=apt_mirror,target=/run/secrets/apt_mirror \\";
+    const PIN_LINE: &str = "    APT_MIRROR=$(cat /run/secrets/apt_mirror) && \\";
+    const SED_LINE: &str = "    sed -i -E \"s#^(deb [^ ]* )https?://[^/]+#\\1${APT_MIRROR}#\" /etc/apt/sources.list && \\";
+
+    let mut out = String::with_capacity(input.len() + 4096);
+    let mut iter = input.split_inclusive('\n').peekable();
+    while let Some(line) = iter.next() {
+        // Detect "RUN " at the start of a line (allow leading whitespace,
+        // though Dockerfiles in this repo never indent RUN).
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("RUN ") {
+            out.push_str(line);
+            continue;
+        }
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+
+        // Collect the full RUN block: this line plus continuations
+        // (lines whose previous line ended with backslash before newline).
+        let mut block: Vec<&str> = vec![line];
+        while block
+            .last()
+            .map(|l| l.trim_end_matches('\n').trim_end().ends_with('\\'))
+            .unwrap_or(false)
+        {
+            match iter.next() {
+                Some(next) => block.push(next),
+                None => break,
+            }
+        }
+
+        // Decide whether to inject.
+        let body: String = block.iter().copied().collect();
+        let already_has_secret = body.contains("id=apt_mirror");
+        if already_has_secret || !body_uses_apt(&body) {
+            for s in &block {
+                out.push_str(s);
+            }
+            continue;
+        }
+
+        // Inject. Replace the original "RUN " with our prefix; everything
+        // after "RUN " on the first line stays intact, just shifted onto
+        // a new line so each command in the chain is on its own line.
+        let first = block[0];
+        let after_run = first.trim_start().strip_prefix("RUN ").unwrap();
+        // Build the rewritten first line + injected lines + the rest.
+        out.push_str(indent);
+        out.push_str("RUN ");
+        out.push_str(PREFIX);
+        out.push('\n');
+        out.push_str(indent);
+        out.push_str(PIN_LINE);
+        out.push('\n');
+        out.push_str(indent);
+        out.push_str(SED_LINE);
+        out.push('\n');
+        out.push_str(indent);
+        out.push_str("    ");
+        out.push_str(after_run);
+        for cont in &block[1..] {
+            out.push_str(cont);
+        }
+    }
+    out
+}
+
+/// True if a RUN body invokes apt as a command. Looks for `apt-get` or
+/// `apt ` as space/newline-separated tokens (avoids false positives like
+/// "snapshot.ubuntu.com" or "captain").
+fn body_uses_apt(body: &str) -> bool {
+    body.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+        .any(|w| w == "apt-get" || w == "apt")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_simple_apt_run() {
+        let src = "FROM cvm-base:latest\nRUN apt-get update && apt-get install foo\n";
+        let out = rewrite_apt_runs(src);
+        assert!(out.contains("--mount=type=secret,id=apt_mirror"));
+        assert!(out.contains("apt-get update && apt-get install foo"));
+    }
+
+    #[test]
+    fn skips_non_apt_run() {
+        let src = "RUN echo hello\nRUN curl example.com\n";
+        let out = rewrite_apt_runs(src);
+        assert!(!out.contains("apt_mirror"));
+    }
+
+    #[test]
+    fn skips_run_that_already_has_secret() {
+        let src = "RUN --mount=type=secret,id=apt_mirror foo apt-get install bar\n";
+        let out = rewrite_apt_runs(src);
+        // Should be unchanged
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn handles_multiline_apt_run() {
+        let src = "RUN apt-get update && \\\n    apt-get install -y foo \\\n    && apt-get clean\n";
+        let out = rewrite_apt_runs(src);
+        assert!(out.contains("--mount=type=secret,id=apt_mirror"));
+        assert!(out.contains("apt-get install -y foo"));
+        // The continuation lines still flow through
+        assert!(out.contains("&& apt-get clean"));
+    }
+}
+
 /// Check that docker is available.
 fn check_docker() -> Result<()> {
     let ok = std::process::Command::new("docker")
@@ -888,15 +1046,25 @@ fn cmd_build(
                     "Building from {} → rootfs (docker buildx)",
                     dockerfile.display(),
                 );
-                // Pass apt mirror via BuildKit secret — see apt_mirror_secret
-                // declaration above. Image Dockerfiles inherit cvm-base's
-                // /etc/apt/sources.list and rarely re-pin, but pass the secret
-                // anyway so any image that does run apt-get sees the proxy.
+                // Pre-process the image Dockerfile: every RUN that uses apt
+                // gets wrapped with the apt_mirror secret + a sources.list
+                // re-pin so it works with this build's (random-port) proxy
+                // even when cvm-base's cached layer has a stale URL inside.
+                // The on-disk Dockerfile is untouched; the rewritten copy
+                // lands in the work_dir tmpfs and is what docker actually
+                // sees.
+                let rewritten_df = rewrite_dockerfile_for_apt(dockerfile, &work_dir)
+                    .context("rewriting image Dockerfile for apt secret")?;
+                tracing::info!(
+                    "Rewrote {} → {}",
+                    dockerfile.display(),
+                    rewritten_df.display()
+                );
                 let secrets: Vec<(&str, &std::path::Path)> = match apt_mirror_secret.as_ref() {
                     Some(p) => vec![("apt_mirror", p.as_path())],
                     None => vec![],
                 };
-                extractor.build_rootfs(dockerfile, &build_context, &[], &secrets)?
+                extractor.build_rootfs(&rewritten_df, &build_context, &[], &secrets)?
             }
         }
     };
