@@ -46,6 +46,7 @@ impl OciExtractor {
         dockerfile: &Path,
         context: &Path,
         build_args: &[(&str, &str)],
+        secrets: &[(&str, &Path)],
     ) -> Result<PathBuf> {
         let rootfs = self.work_dir.join("rootfs");
         if rootfs.exists() {
@@ -85,6 +86,13 @@ impl OciExtractor {
         for (key, val) in build_args {
             cmd.arg("--build-arg");
             cmd.arg(format!("{}={}", key, val));
+        }
+
+        // BuildKit secrets — used for the apt mirror URL (random per-run port,
+        // and we don't want to bust the layer cache fingerprint each time).
+        for (id, src) in secrets {
+            cmd.arg("--secret");
+            cmd.arg(format!("id={},src={}", id, src.display()));
         }
 
         cmd.arg(context.to_string_lossy().to_string());

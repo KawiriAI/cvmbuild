@@ -750,6 +750,23 @@ fn cmd_build(
             }
         };
 
+        // Stage the apt mirror URL as a BuildKit secret rather than a build arg.
+        // Reason: the proxy port is random per-cvmbuild-run, so passing the URL
+        // via --build-arg makes every `RUN` line that references ${APT_MIRROR}
+        // hash differently between runs and invalidates the layer cache —
+        // forcing cvm-base to rebuild from scratch on every invocation. With
+        // --mount=type=secret the secret content stays out of the layer
+        // fingerprint (only the mount declaration is hashed), so an unchanged
+        // Dockerfile reuses cached layers across runs even though the proxy
+        // port differs. Secret contents also never end up in image layers.
+        let apt_mirror_secret = if !apt_mirror.is_empty() {
+            let p = work_dir.join("apt_mirror.secret");
+            std::fs::write(&p, &apt_mirror).context("writing apt_mirror secret file")?;
+            Some(p)
+        } else {
+            None
+        };
+
         // (Re)build the base image whenever cvm.toml configures one.
         //
         // We used to skip this when `docker image inspect <base_image>` succeeded,
@@ -809,9 +826,13 @@ fn cmd_build(
                     "-t",
                     base_image,
                 ]);
-                // Pass APT_MIRROR if set
-                if !apt_mirror.is_empty() {
-                    cmd.args(["--build-arg", &format!("APT_MIRROR={}", apt_mirror)]);
+                // Pass APT_MIRROR via BuildKit secret (see comment near
+                // apt_mirror_secret declaration above for why).
+                if let Some(ref secret_path) = apt_mirror_secret {
+                    cmd.args([
+                        "--secret",
+                        &format!("id=apt_mirror,src={}", secret_path.display()),
+                    ]);
                 }
                 // Pass BUILDX_CACHE if set
                 if let Ok(cache) = std::env::var("BUILDX_CACHE") {
@@ -867,13 +888,15 @@ fn cmd_build(
                     "Building from {} → rootfs (docker buildx)",
                     dockerfile.display(),
                 );
-                // Pass APT_MIRROR so image Dockerfiles use the cache proxy
-                let build_args: Vec<(&str, &str)> = if apt_mirror.is_empty() {
-                    vec![]
-                } else {
-                    vec![("APT_MIRROR", &apt_mirror)]
+                // Pass apt mirror via BuildKit secret — see apt_mirror_secret
+                // declaration above. Image Dockerfiles inherit cvm-base's
+                // /etc/apt/sources.list and rarely re-pin, but pass the secret
+                // anyway so any image that does run apt-get sees the proxy.
+                let secrets: Vec<(&str, &std::path::Path)> = match apt_mirror_secret.as_ref() {
+                    Some(p) => vec![("apt_mirror", p.as_path())],
+                    None => vec![],
                 };
-                extractor.build_rootfs(dockerfile, &build_context, &build_args)?
+                extractor.build_rootfs(dockerfile, &build_context, &[], &secrets)?
             }
         }
     };
