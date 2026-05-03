@@ -550,8 +550,16 @@ fn strip_suid_recursive(dir: &Path, count: &mut u32) -> Result<()> {
 }
 
 /// Validate generated nftables rules for security.
+///
+/// The port-22 / port-80 checks are default-secure backstops for chat-only
+/// CVMs that should never expose SSH or plain HTTP. Images that legitimately
+/// want one or the other (e.g. an SSH-CVM) opt out via the matching catalog
+/// check name in `[assert].exclude`:
+///   - `firewall_no_ssh`        → skip the port-22 check
+///   - `firewall_no_http_plain` → skip the port-80 check
 fn validate_nftables(rules: &str, config: &Config) -> Result<()> {
     let mut errors = Vec::new();
+    let excluded: &[String] = &config.assert.exclude;
 
     // All chains must have policy drop
     let chain_count = rules.matches("policy drop").count();
@@ -559,13 +567,17 @@ fn validate_nftables(rules: &str, config: &Config) -> Result<()> {
         errors.push("not all chains have 'policy drop'".to_string());
     }
 
-    // No SSH allowed
-    if rules.contains("dport 22 ") || rules.contains("dport 22\n") {
+    // No SSH allowed (unless explicitly opted in via [assert].exclude).
+    if !excluded.iter().any(|s| s == "firewall_no_ssh")
+        && (rules.contains("dport 22 ") || rules.contains("dport 22\n"))
+    {
         errors.push("SSH (port 22) must not be allowed in CVM firewall".to_string());
     }
 
-    // No plain HTTP
-    if rules.contains("dport 80 ") || rules.contains("dport 80\n") {
+    // No plain HTTP (unless explicitly opted in via [assert].exclude).
+    if !excluded.iter().any(|s| s == "firewall_no_http_plain")
+        && (rules.contains("dport 80 ") || rules.contains("dport 80\n"))
+    {
         errors.push("plain HTTP (port 80) must not be allowed".to_string());
     }
 
