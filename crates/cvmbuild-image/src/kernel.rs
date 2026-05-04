@@ -25,7 +25,11 @@ pub fn extract_kernel(rootfs: &Path, output_dir: &Path, name: &str) -> Result<(P
 
 /// Extract the base initrd from a rootfs.
 ///
-/// Looks for `/boot/initrd.img-*` in the rootfs directory.
+/// Looks for the conventional initrd filename in `/boot/`, trying:
+///   - `initrd.img-*`     (Debian / Ubuntu)
+///   - `initramfs-*.img`  (Fedora / RHEL / SUSE)
+///   - `initramfs-linux*.img` (Arch / Alpine variants)
+///
 /// Copies it to `output_dir/{name}.initrd.base` and returns (path, sha256).
 pub fn extract_base_initrd(
     rootfs: &Path,
@@ -33,8 +37,17 @@ pub fn extract_base_initrd(
     name: &str,
 ) -> Result<(PathBuf, String)> {
     let boot_dir = rootfs.join("boot");
-    let initrd = find_single_glob(&boot_dir, "initrd.img-*")
-        .context("looking for initrd.img in rootfs /boot/")?;
+    const PATTERNS: &[&str] = &["initrd.img-*", "initramfs-*.img", "initramfs-linux*.img"];
+    let initrd = PATTERNS
+        .iter()
+        .find_map(|p| find_single_glob(&boot_dir, p).ok())
+        .with_context(|| {
+            format!(
+                "no initrd in {} matching any of {:?}",
+                boot_dir.display(),
+                PATTERNS
+            )
+        })?;
 
     let output_path = output_dir.join(format!("{name}.initrd.base"));
     std::fs::copy(&initrd, &output_path)

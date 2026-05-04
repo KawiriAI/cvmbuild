@@ -1,6 +1,3 @@
-mod cache;
-mod kawiri_cache;
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -109,6 +106,30 @@ enum Commands {
         output: PathBuf,
     },
 
+    /// Re-derive every hash and measurement from the artifacts in the output
+    /// directory and assert they match what manifest.json claims (or, with
+    /// --against, a checked-in expected-manifest file). Returns non-zero on
+    /// any mismatch.
+    Verify {
+        /// Build output directory
+        #[arg(short, long, default_value = "build")]
+        output: PathBuf,
+        /// Verify against a specific expected-manifest JSON instead of
+        /// the manifest.json adjacent to the artifacts. Use this in CI to
+        /// gate on a checked-in `manifest.expected.json`.
+        #[arg(long)]
+        against: Option<PathBuf>,
+    },
+
+    /// Diff two build output directories: manifest fields, plus whichever
+    /// underlying artifacts differ. Pure analysis — no Docker, no network.
+    Diff {
+        /// First build output directory
+        a: PathBuf,
+        /// Second build output directory
+        b: PathBuf,
+    },
+
     /// Print QEMU boot command from built artifacts
     BootCmd {
         /// Build output directory
@@ -191,20 +212,19 @@ fn resolve_config(image_dir: &std::path::Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // Diff is pure analysis — does not need a cvm.toml in cwd.
+    if let Commands::Diff { a, b } = &cli.command {
+        return cmd_diff(a, b);
+    }
+
     let (image_dir, config_path) = resolve_config(&cli.image_dir)?;
     let mut config = cvmbuild_config::Config::load(&config_path).context("loading config")?;
 
     // Resolve OVMF filenames against:
     //   1. --ovmf-dir / OVMF_DIR (explicit operator override)
-    //   2. cached cvm.toml [image].ovmf_version pin (downloads release if missing)
-    //   3. config file directory (backwards compat)
+    //   2. config file directory (backwards compat)
     if let Some(ref ovmf_dir) = cli.ovmf_dir {
         config.resolve_ovmf(ovmf_dir);
-    } else if let Some(version) = config.image.ovmf_version.clone() {
-        let dir = kawiri_cache::ensure_ovmf(&version)
-            .with_context(|| format!("resolving pinned ovmf v{version} from cache"))?;
-        tracing::info!("Using cached ovmf v{version} at {}", dir.display());
-        config.resolve_ovmf(&dir);
     } else {
         let base = config_path.parent().unwrap_or(std::path::Path::new("."));
         config.resolve_ovmf(base);
@@ -244,6 +264,8 @@ fn run(cli: Cli) -> Result<()> {
             uuid,
         } => cmd_verity_disk(&source, &output, &label, &uuid),
         Commands::Measure { output } => cmd_measure(&config, &output),
+        Commands::Verify { output, against } => cmd_verify(&config, &output, against.as_deref()),
+        Commands::Diff { .. } => unreachable!("handled before config load"),
         Commands::BootCmd {
             output,
             tee,
@@ -345,221 +367,6 @@ fn cmd_checks(config: &cvmbuild_config::Config) -> Result<()> {
     Ok(())
 }
 
-/// Stage the pinned kawa release binary next to the base-image Dockerfile so
-/// `COPY kawa /usr/local/bin/kawa` picks up the exact released bytes.
-///
-/// The cache (under /var/lib/kawiri/kawa/<version>/) holds the canonical copy;
-/// we copy from there into the build context. We always overwrite to avoid a
-/// stale binary from a previous build sneaking into a new measurement.
-fn stage_kawa(
-    config: &cvmbuild_config::Config,
-    image_dir: &std::path::Path,
-    version: &str,
-) -> Result<()> {
-    let dockerfile_rel = config
-        .image
-        .base_image_dockerfile
-        .as_deref()
-        .context("kawa_version is set but base_image_dockerfile is not — cvmbuild needs to know where to stage the kawa binary")?;
-
-    let build_context = if let Some(ref ctx) = config.image.context {
-        let p = std::path::Path::new(ctx);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            image_dir.join(ctx)
-        }
-    } else {
-        image_dir.to_path_buf()
-    };
-    let dockerfile_path = build_context.join(dockerfile_rel);
-    let staging_dir = dockerfile_path
-        .parent()
-        .context("base_image_dockerfile has no parent directory")?;
-    let target = staging_dir.join("kawa");
-
-    let variant = config.image.kawa_variant.as_deref();
-    let cached = kawiri_cache::ensure_kawa(version, variant)?;
-    std::fs::copy(&cached, &target)
-        .with_context(|| format!("staging kawa binary at {}", target.display()))?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
-    let label = match variant {
-        Some("mock") => "kawa-mocktee",
-        _ => "kawa",
-    };
-    tracing::info!(
-        "Staged {label} v{version} → {} (from {})",
-        target.display(),
-        cached.display()
-    );
-    if variant == Some("mock") {
-        tracing::warn!(
-            "image is being built with kawa-mocktee — clients cannot attest \
-             this CVM with a real validator. For testing only."
-        );
-    }
-    Ok(())
-}
-
-/// Rewrite a Dockerfile so any `RUN` block that uses apt gets the
-/// apt-mirror secret mount and re-stamps `/etc/apt/sources.list` with this
-/// build's proxy URL before running its original command. Returns the path
-/// to the rewritten file (next to the original in `output_dir`); the source
-/// Dockerfile on disk is never modified.
-///
-/// Why we need this: cvm-base writes `/etc/apt/sources.list` pointing at
-/// the proxy URL active at cvm-base build time. BuildKit caches that layer
-/// (the secret-mount refactor on cvm-base keeps the layer hash stable
-/// across runs even when the proxy port changes — see the
-/// apt_mirror_secret comment in `cmd_build`). But the *content* of the
-/// cached layer still has the original port baked into the file. Any
-/// child image that inherits cvm-base and runs `apt-get update` in a
-/// later cvmbuild session connects to a port that's long gone.
-///
-/// The rewriter prepends each apt-using RUN with the current build's
-/// secret + a sed pin so the file is corrected just-in-time. Image
-/// Dockerfiles stay clean — authors write plain `RUN apt-get install ...`
-/// and don't think about secrets.
-///
-/// Skipping rules:
-///   - RUNs that already declare `id=apt_mirror` (the cvm-base / cvm-gpu-base
-///     Dockerfiles do this themselves and are written to handle it correctly)
-///   - RUNs whose body doesn't reference `apt-get` or `apt ` as a token
-fn rewrite_dockerfile_for_apt(input: &std::path::Path, output_dir: &std::path::Path) -> Result<std::path::PathBuf> {
-    let content = std::fs::read_to_string(input)
-        .with_context(|| format!("reading {}", input.display()))?;
-    let rewritten = rewrite_apt_runs(&content);
-    let output = output_dir.join("Dockerfile.rewritten");
-    std::fs::write(&output, rewritten.as_bytes())
-        .with_context(|| format!("writing {}", output.display()))?;
-    Ok(output)
-}
-
-/// Pure transformation. Public-by-module-default for the unit test below.
-fn rewrite_apt_runs(input: &str) -> String {
-    // Prefix injected after `RUN ` for apt-using blocks. Indentation is added
-    // per-call to match whatever indent the RUN had (usually none).
-    //
-    // The sed pattern matches the host:port portion of a deb line and replaces
-    // it with the secret value, leaving the path (snapshot date + suite +
-    // components) intact:
-    //   deb [opts] http://OLD-HOST/ubuntu/<snap> resolute main ...
-    //                       ^^^^^^^^^^^^^^^^^^^^^^
-    //                       this part replaced
-    const PREFIX: &str = "--mount=type=secret,id=apt_mirror,target=/run/secrets/apt_mirror \\";
-    const PIN_LINE: &str = "    APT_MIRROR=$(cat /run/secrets/apt_mirror) && \\";
-    const SED_LINE: &str = "    sed -i -E \"s#^(deb [^ ]* )https?://[^/]+#\\1${APT_MIRROR}#\" /etc/apt/sources.list && \\";
-
-    let mut out = String::with_capacity(input.len() + 4096);
-    let mut iter = input.split_inclusive('\n').peekable();
-    while let Some(line) = iter.next() {
-        // Detect "RUN " at the start of a line (allow leading whitespace,
-        // though Dockerfiles in this repo never indent RUN).
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("RUN ") {
-            out.push_str(line);
-            continue;
-        }
-        let indent_len = line.len() - trimmed.len();
-        let indent = &line[..indent_len];
-
-        // Collect the full RUN block: this line plus continuations
-        // (lines whose previous line ended with backslash before newline).
-        let mut block: Vec<&str> = vec![line];
-        while block
-            .last()
-            .map(|l| l.trim_end_matches('\n').trim_end().ends_with('\\'))
-            .unwrap_or(false)
-        {
-            match iter.next() {
-                Some(next) => block.push(next),
-                None => break,
-            }
-        }
-
-        // Decide whether to inject.
-        let body: String = block.iter().copied().collect();
-        let already_has_secret = body.contains("id=apt_mirror");
-        if already_has_secret || !body_uses_apt(&body) {
-            for s in &block {
-                out.push_str(s);
-            }
-            continue;
-        }
-
-        // Inject. Replace the original "RUN " with our prefix; everything
-        // after "RUN " on the first line stays intact, just shifted onto
-        // a new line so each command in the chain is on its own line.
-        let first = block[0];
-        let after_run = first.trim_start().strip_prefix("RUN ").unwrap();
-        // Build the rewritten first line + injected lines + the rest.
-        out.push_str(indent);
-        out.push_str("RUN ");
-        out.push_str(PREFIX);
-        out.push('\n');
-        out.push_str(indent);
-        out.push_str(PIN_LINE);
-        out.push('\n');
-        out.push_str(indent);
-        out.push_str(SED_LINE);
-        out.push('\n');
-        out.push_str(indent);
-        out.push_str("    ");
-        out.push_str(after_run);
-        for cont in &block[1..] {
-            out.push_str(cont);
-        }
-    }
-    out
-}
-
-/// True if a RUN body invokes apt as a command. Looks for `apt-get` or
-/// `apt ` as space/newline-separated tokens (avoids false positives like
-/// "snapshot.ubuntu.com" or "captain").
-fn body_uses_apt(body: &str) -> bool {
-    body.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
-        .any(|w| w == "apt-get" || w == "apt")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rewrites_simple_apt_run() {
-        let src = "FROM cvm-base:latest\nRUN apt-get update && apt-get install foo\n";
-        let out = rewrite_apt_runs(src);
-        assert!(out.contains("--mount=type=secret,id=apt_mirror"));
-        assert!(out.contains("apt-get update && apt-get install foo"));
-    }
-
-    #[test]
-    fn skips_non_apt_run() {
-        let src = "RUN echo hello\nRUN curl example.com\n";
-        let out = rewrite_apt_runs(src);
-        assert!(!out.contains("apt_mirror"));
-    }
-
-    #[test]
-    fn skips_run_that_already_has_secret() {
-        let src = "RUN --mount=type=secret,id=apt_mirror foo apt-get install bar\n";
-        let out = rewrite_apt_runs(src);
-        // Should be unchanged
-        assert_eq!(out, src);
-    }
-
-    #[test]
-    fn handles_multiline_apt_run() {
-        let src = "RUN apt-get update && \\\n    apt-get install -y foo \\\n    && apt-get clean\n";
-        let out = rewrite_apt_runs(src);
-        assert!(out.contains("--mount=type=secret,id=apt_mirror"));
-        assert!(out.contains("apt-get install -y foo"));
-        // The continuation lines still flow through
-        assert!(out.contains("&& apt-get clean"));
-    }
-}
-
 /// Check that docker is available.
 fn check_docker() -> Result<()> {
     let ok = std::process::Command::new("docker")
@@ -569,9 +376,256 @@ fn check_docker() -> Result<()> {
         .status()
         .is_ok();
     if !ok {
-        anyhow::bail!("docker not found — install it: apt install docker.io docker-buildx");
+        anyhow::bail!("docker not found in PATH — install Docker with BuildKit support");
     }
     Ok(())
+}
+
+/// If running under sudo, chown the path tree back to the invoking user so
+/// `git status` and other user-side tools don't trip over root-owned build
+/// artifacts. No-op when SUDO_UID / SUDO_GID aren't set, so direct invocations
+/// (no sudo) leave permissions alone.
+fn chown_back_if_sudo(path: &std::path::Path) -> Result<()> {
+    let (uid, gid) = match (
+        std::env::var("SUDO_UID").ok(),
+        std::env::var("SUDO_GID").ok(),
+    ) {
+        (Some(u), Some(g)) if !u.is_empty() && !g.is_empty() => (u, g),
+        _ => return Ok(()),
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    let status = std::process::Command::new("chown")
+        .args(["-R", &format!("{uid}:{gid}")])
+        .arg(path)
+        .status()
+        .with_context(|| format!("chown -R {uid}:{gid} {}", path.display()))?;
+    if !status.success() {
+        anyhow::bail!("chown -R failed for {}", path.display());
+    }
+    Ok(())
+}
+
+/// Materialize `[image].build_args` from cvm.toml as docker --build-arg pairs.
+///
+/// Also auto-injects build-args from the operator's environment for a small
+/// allowlist of well-known keys (`APT_MIRROR`, `APT_SNAPSHOT`). cvm.toml
+/// always wins if it sets the same key. Env-var injection lets an operator
+/// declare a host-wide convention (e.g. `export APT_MIRROR=http://127.0.0.1:19479`)
+/// without editing every cvm.toml.
+fn build_args_from_config(config: &cvmbuild_config::Config) -> Vec<(String, String)> {
+    let mut args: Vec<(String, String)> = config
+        .image
+        .build_args
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    const ENV_AUTOFORWARD: &[&str] = &["APT_MIRROR", "APT_SNAPSHOT"];
+    for key in ENV_AUTOFORWARD {
+        if args.iter().any(|(k, _)| k == key) {
+            continue;
+        }
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                tracing::info!("forwarding {key}=… from env to docker --build-arg");
+                args.push((key.to_string(), v));
+            }
+        }
+    }
+    args
+}
+
+/// Resolve `[image].build_contexts` from cvm.toml.
+///
+/// - Local paths (no `://`) resolve against the image directory and must exist.
+/// - Scheme-prefixed sources (`docker-image://`, `oci-layout:///`, `git://`,
+///   `http://`, `https://`) pass through to docker buildx untouched.
+fn build_contexts_from_config(
+    config: &cvmbuild_config::Config,
+    image_dir: &std::path::Path,
+) -> Result<Vec<(String, String)>> {
+    config
+        .image
+        .build_contexts
+        .iter()
+        .map(|c| {
+            let resolved = if has_scheme(&c.src) {
+                c.src.clone()
+            } else {
+                let p = std::path::Path::new(&c.src);
+                let abs = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    image_dir.join(p)
+                };
+                if !abs.exists() {
+                    anyhow::bail!(
+                        "build_context '{}' src '{}' does not exist (resolved to {})",
+                        c.name,
+                        c.src,
+                        abs.display()
+                    );
+                }
+                abs.to_string_lossy().to_string()
+            };
+            Ok((c.name.clone(), resolved))
+        })
+        .collect()
+}
+
+/// True iff `s` looks like a buildx-supported URL/scheme rather than a path.
+fn has_scheme(s: &str) -> bool {
+    // Match the prefixes docker buildx --build-context accepts. Everything
+    // else (including bare relative/absolute paths) is treated as a path.
+    const SCHEMES: &[&str] = &[
+        "docker-image://",
+        "oci-layout://",
+        "container-image://",
+        "target:",
+        "git://",
+        "http://",
+        "https://",
+    ];
+    SCHEMES.iter().any(|p| s.starts_with(p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_scheme_matches_buildx_url_forms() {
+        assert!(has_scheme("docker-image://foo:bar"));
+        assert!(has_scheme("oci-layout:///abs/path"));
+        assert!(has_scheme("container-image://repo:tag"));
+        assert!(has_scheme("target:cvm-base-prod"));
+        assert!(has_scheme("git://example.com/repo.git#branch"));
+        assert!(has_scheme("https://example.com/file.tar.gz"));
+        assert!(has_scheme("http://example.com/file.tar.gz"));
+    }
+
+    #[test]
+    fn has_scheme_rejects_paths() {
+        assert!(!has_scheme("/abs/path"));
+        assert!(!has_scheme("relative/path"));
+        assert!(!has_scheme("./relative"));
+        assert!(!has_scheme("../parent"));
+        assert!(!has_scheme(""));
+        // A bare scheme-looking word that isn't one of ours is NOT a scheme.
+        assert!(!has_scheme("file://path"));
+    }
+
+    #[test]
+    fn build_contexts_resolves_relative_path_against_image_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_dir = tmp.path().join("img");
+        let kawa_dir = tmp.path().join("img/../shared/kawa");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::create_dir_all(&kawa_dir).unwrap();
+
+        let toml = format!(
+            r#"
+[image]
+id = "x"
+version = "0.1.0"
+[[image.build_contexts]]
+name = "kawa"
+src = "../shared/kawa"
+[kernel]
+cmdline = "x"
+[verity]
+[security]
+[firewall]
+"#,
+        );
+        let config = cvmbuild_config::Config::parse(&toml).unwrap();
+        let resolved = build_contexts_from_config(&config, &image_dir).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "kawa");
+        // Resolves to <image_dir>/../shared/kawa, kept un-canonicalized so
+        // operators can see exactly what they wrote.
+        assert!(
+            resolved[0].1.contains("shared/kawa"),
+            "got {}",
+            resolved[0].1
+        );
+    }
+
+    #[test]
+    fn build_contexts_passes_through_scheme_urls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml = r#"
+[image]
+id = "x"
+version = "0.1.0"
+[[image.build_contexts]]
+name = "cvm-base"
+src = "docker-image://cvm-base:mock"
+[kernel]
+cmdline = "x"
+[verity]
+[security]
+[firewall]
+"#;
+        let config = cvmbuild_config::Config::parse(toml).unwrap();
+        let resolved = build_contexts_from_config(&config, tmp.path()).unwrap();
+        assert_eq!(resolved.len(), 1);
+        // Pass-through: docker-image:// URL not resolved as a path.
+        assert_eq!(resolved[0].1, "docker-image://cvm-base:mock");
+    }
+
+    #[test]
+    fn build_contexts_rejects_missing_local_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml = r#"
+[image]
+id = "x"
+version = "0.1.0"
+[[image.build_contexts]]
+name = "kawa"
+src = "does-not-exist"
+[kernel]
+cmdline = "x"
+[verity]
+[security]
+[firewall]
+"#;
+        let config = cvmbuild_config::Config::parse(toml).unwrap();
+        let err = build_contexts_from_config(&config, tmp.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("does not exist"), "got {msg}");
+        assert!(msg.contains("kawa"), "got {msg}");
+    }
+}
+
+/// Resolve `[image].build_secrets` from cvm.toml. `src` paths are resolved
+/// relative to the image directory; absolute paths pass through.
+fn build_secrets_from_config(
+    config: &cvmbuild_config::Config,
+    image_dir: &std::path::Path,
+) -> Result<Vec<(String, std::path::PathBuf)>> {
+    config
+        .image
+        .build_secrets
+        .iter()
+        .map(|s| {
+            let p = std::path::Path::new(&s.src);
+            let resolved = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                image_dir.join(p)
+            };
+            if !resolved.is_file() {
+                anyhow::bail!(
+                    "build_secret '{}' src '{}' is not a readable file",
+                    s.id,
+                    resolved.display()
+                );
+            }
+            Ok((s.id.clone(), resolved))
+        })
+        .collect()
 }
 
 /// Download models specified in [[models]] from HuggingFace.
@@ -873,157 +927,6 @@ fn cmd_build(
     } else {
         check_docker()?;
 
-        // Stage the pinned kawa binary into the base-image build context so the
-        // base Dockerfile's `COPY kawa /usr/local/bin/kawa` picks up the exact
-        // released bytes — kawa is part of the rootfs and its hash feeds into
-        // every SNP/TDX measurement, so the version pin in cvm.toml MUST be
-        // what actually gets baked in.
-        if let Some(ref version) = config.image.kawa_version {
-            stage_kawa(config, image_dir, version)?;
-        }
-
-        // Resolve APT_MIRROR: use env var if set, otherwise start embedded cache proxy.
-        // Caches to /var/cache/cvmbuild/apt/. Docker reaches it via --network=host.
-        let (apt_mirror, _apt_proxy) = if std::env::var("APT_MIRROR")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        {
-            tracing::info!("APT_MIRROR already set, skipping embedded cache proxy");
-            (std::env::var("APT_MIRROR").unwrap_or_default(), None)
-        } else {
-            let cache_dir = std::path::Path::new("/var/cache/cvmbuild/apt");
-            let _ = std::fs::create_dir_all(cache_dir);
-            match cache::AptCacheProxy::start("http://snapshot.ubuntu.com", cache_dir) {
-                Ok(proxy) => {
-                    let mirror_url = proxy.url();
-                    tracing::info!("apt cache proxy: {mirror_url} → http://snapshot.ubuntu.com");
-                    (mirror_url, Some(proxy))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to start apt cache proxy: {e} (continuing without cache)"
-                    );
-                    (String::new(), None)
-                }
-            }
-        };
-
-        // Stage the apt mirror URL as a BuildKit secret rather than a build arg.
-        // Reason: the proxy port is random per-cvmbuild-run, so passing the URL
-        // via --build-arg makes every `RUN` line that references ${APT_MIRROR}
-        // hash differently between runs and invalidates the layer cache —
-        // forcing cvm-base to rebuild from scratch on every invocation. With
-        // --mount=type=secret the secret content stays out of the layer
-        // fingerprint (only the mount declaration is hashed), so an unchanged
-        // Dockerfile reuses cached layers across runs even though the proxy
-        // port differs. Secret contents also never end up in image layers.
-        let apt_mirror_secret = if !apt_mirror.is_empty() {
-            let p = work_dir.join("apt_mirror.secret");
-            std::fs::write(&p, &apt_mirror).context("writing apt_mirror secret file")?;
-            Some(p)
-        } else {
-            None
-        };
-
-        // (Re)build the base image whenever cvm.toml configures one.
-        //
-        // We used to skip this when `docker image inspect <base_image>` succeeded,
-        // but that meant a stale cvm-base:latest from a previous build (with a
-        // different kawa binary, e.g. production vs kawa-mocktee) would silently
-        // get reused — the COPY kawa layer never re-runs because docker doesn't
-        // know its inputs changed. Always invoke docker buildx instead and let
-        // buildkit's content-addressed layer cache keep it cheap: unchanged
-        // inputs → seconds, every layer cached; changed kawa → invalidates from
-        // COPY kawa onwards, still fast.
-        if let Some(ref base_image) = config.image.base_image {
-            {
-                let base_dockerfile = match config.image.base_image_dockerfile.as_deref() {
-                    Some(d) => d,
-                    None => anyhow::bail!(
-                        "base_image '{}' not found and no base_image_dockerfile specified in cvm.toml",
-                        base_image
-                    ),
-                };
-                let build_context = if let Some(ref ctx) = config.image.context {
-                    let p = std::path::Path::new(ctx);
-                    if p.is_absolute() {
-                        p.to_path_buf()
-                    } else {
-                        image_dir.join(ctx).canonicalize().with_context(|| {
-                            format!("resolving context path: {}", image_dir.join(ctx).display())
-                        })?
-                    }
-                } else {
-                    image_dir.to_path_buf()
-                };
-                let df_path = build_context.join(base_dockerfile);
-                if !df_path.is_file() {
-                    anyhow::bail!(
-                        "base_image_dockerfile '{}' not found at {}",
-                        base_dockerfile,
-                        df_path.display()
-                    );
-                }
-                tracing::info!(
-                    "Base image '{}' not found — building from {}",
-                    base_image,
-                    df_path.display()
-                );
-                println!(
-                    "Building base image: {} (from {})",
-                    base_image, base_dockerfile
-                );
-
-                let mut cmd = std::process::Command::new("docker");
-                cmd.args([
-                    "buildx",
-                    "build",
-                    "--network=host",
-                    "-f",
-                    &df_path.to_string_lossy(),
-                    "-t",
-                    base_image,
-                ]);
-                // Pass APT_MIRROR via BuildKit secret (see comment near
-                // apt_mirror_secret declaration above for why).
-                if let Some(ref secret_path) = apt_mirror_secret {
-                    cmd.args([
-                        "--secret",
-                        &format!("id=apt_mirror,src={}", secret_path.display()),
-                    ]);
-                }
-                // Pass BUILDX_CACHE if set
-                if let Ok(cache) = std::env::var("BUILDX_CACHE") {
-                    if !cache.is_empty() {
-                        let (from, to) = if cache.starts_with('/') {
-                            (
-                                format!("type=local,src={}/cvm-base", cache),
-                                format!("type=local,dest={}/cvm-base,mode=max", cache),
-                            )
-                        } else {
-                            (
-                                format!("type=registry,ref={}/cvm-base", cache),
-                                format!("type=registry,ref={}/cvm-base,mode=max", cache),
-                            )
-                        };
-                        cmd.args(["--cache-from", &from, "--cache-to", &to]);
-                    }
-                }
-                // The base-image Dockerfile is self-contained — its only inputs are
-                // its own directory (the kawa binary staged by stage_kawa, plus heredoc
-                // content). Use the dockerfile's parent as the docker build context so
-                // `COPY kawa /usr/local/bin/kawa` resolves to the staged binary instead
-                // of looking for it at the global config context root.
-                let base_build_context = df_path.parent().unwrap_or(&build_context);
-                cmd.arg(base_build_context.to_string_lossy().to_string());
-                let status = cmd.status().context("failed to build base image")?;
-                if !status.success() {
-                    anyhow::bail!("base image build failed for '{}'", base_image);
-                }
-                println!("Base image '{}' built successfully", base_image);
-            }
-        }
-
         match &source {
             ImageSource::Pull(r) => {
                 tracing::info!("Pulling image: {}", r);
@@ -1046,25 +949,28 @@ fn cmd_build(
                     "Building from {} → rootfs (docker buildx)",
                     dockerfile.display(),
                 );
-                // Pre-process the image Dockerfile: every RUN that uses apt
-                // gets wrapped with the apt_mirror secret + a sources.list
-                // re-pin so it works with this build's (random-port) proxy
-                // even when cvm-base's cached layer has a stale URL inside.
-                // The on-disk Dockerfile is untouched; the rewritten copy
-                // lands in the work_dir tmpfs and is what docker actually
-                // sees.
-                let rewritten_df = rewrite_dockerfile_for_apt(dockerfile, &work_dir)
-                    .context("rewriting image Dockerfile for apt secret")?;
-                tracing::info!(
-                    "Rewrote {} → {}",
-                    dockerfile.display(),
-                    rewritten_df.display()
-                );
-                let secrets: Vec<(&str, &std::path::Path)> = match apt_mirror_secret.as_ref() {
-                    Some(p) => vec![("apt_mirror", p.as_path())],
-                    None => vec![],
-                };
-                extractor.build_rootfs(&rewritten_df, &build_context, &[], &secrets)?
+                let build_args = build_args_from_config(config);
+                let build_arg_refs: Vec<(&str, &str)> = build_args
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                let secrets = build_secrets_from_config(config, image_dir)?;
+                let secret_refs: Vec<(&str, &std::path::Path)> = secrets
+                    .iter()
+                    .map(|(id, p)| (id.as_str(), p.as_path()))
+                    .collect();
+                let contexts = build_contexts_from_config(config, image_dir)?;
+                let context_refs: Vec<(&str, &str)> = contexts
+                    .iter()
+                    .map(|(n, s)| (n.as_str(), s.as_str()))
+                    .collect();
+                extractor.build_rootfs(
+                    dockerfile,
+                    &build_context,
+                    &build_arg_refs,
+                    &secret_refs,
+                    &context_refs,
+                )?
             }
         }
     };
@@ -1105,9 +1011,18 @@ fn cmd_build(
     let result = sealer.seal(&rootfs, config)?;
 
     // Step 5: Build verity disks that have source defined
-    // If config_env is set in cvm.toml, generate disks/config/config.env automatically
+    // If config_env is set in cvm.toml, generate disks/config/config.env
+    // automatically. Wipe any pre-existing _config_env from a prior build:
+    // mke2fs -d records the source directory's inode metadata in the ext4
+    // image, and metadata that shifts across runs (timestamps, ownership
+    // touched by interrupted builds) silently drifts the resulting
+    // config_roothash even when the file content is byte-identical.
     let _config_env_dir = if !config.config_env.is_empty() {
         let dir = output.join("_config_env");
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("removing stale {}", dir.display()))?;
+        }
         std::fs::create_dir_all(&dir)?;
         let env_content: String = config
             .config_env
@@ -1243,6 +1158,16 @@ fn cmd_build(
         tracing::info!("Cleaning up tmpfs work dir");
         let _ = std::fs::remove_dir_all(&work_dir);
     }
+
+    // Hand build artifacts back to the invoking user when running under sudo
+    // (cvmbuild typically needs root for Docker, but the user wants `git
+    // status` and friends to work without sudo afterwards).
+    //
+    // Only `output/` is chowned. `disks/` is intentionally left alone:
+    // mke2fs -d preserves source-file ownership in the resulting ext4
+    // image, so chowning disks/ would silently change the verity-disk
+    // roothash on the next rebuild. disks/ is gitignored regardless.
+    chown_back_if_sudo(output)?;
 
     Ok(())
 }
@@ -1456,6 +1381,400 @@ fn cmd_measure(config: &cvmbuild_config::Config, output: &std::path::Path) -> Re
     }
 
     Ok(())
+}
+
+/// Re-derive every hash and measurement from artifacts in `output` and assert
+/// they match `manifest.json` (or `against` if provided). Errors surface
+/// field-by-field so the operator can see exactly which value drifted.
+fn cmd_verify(
+    config: &cvmbuild_config::Config,
+    output: &std::path::Path,
+    against: Option<&std::path::Path>,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let manifest_path = match against {
+        Some(p) => p.to_path_buf(),
+        None => output.join("manifest.json"),
+    };
+    if !manifest_path.exists() {
+        anyhow::bail!("{} not found", manifest_path.display());
+    }
+    println!("Verifying artifacts in {} against {}", output.display(), manifest_path.display());
+    let manifest_text = std::fs::read_to_string(&manifest_path)?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text)?;
+    let inputs = manifest
+        .get("buildInputs")
+        .context("manifest.json missing buildInputs")?;
+    let measurements = manifest
+        .get("measurements")
+        .context("manifest.json missing measurements")?;
+
+    fn sha256_file(p: &std::path::Path) -> Result<String> {
+        let bytes = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
+        Ok(hex::encode(Sha256::digest(&bytes)))
+    }
+
+    let name = format!("{}_{}", config.image.id, config.image.version);
+    let mut failures: Vec<String> = Vec::new();
+    let mut check_field = |label: &str, claimed: Option<&str>, actual: &str| {
+        match claimed {
+            Some(c) if c == actual => println!("  OK   {label} = {actual}"),
+            Some(c) => failures.push(format!("{label}: manifest={c} actual={actual}")),
+            None => failures.push(format!("{label}: missing in manifest")),
+        }
+    };
+
+    let kernel = output.join(format!("{name}.vmlinuz"));
+    let initrd = output.join(format!("{name}.initrd"));
+    let raw = output.join(format!("{name}.raw"));
+    let roothash_file = output.join(format!("{name}.roothash"));
+
+    if kernel.is_file() {
+        check_field(
+            "kernel_sha256",
+            inputs.get("kernel_sha256").and_then(|v| v.as_str()),
+            &sha256_file(&kernel)?,
+        );
+    }
+    if initrd.is_file() {
+        check_field(
+            "initrd_sha256",
+            inputs.get("initrd_sha256").and_then(|v| v.as_str()),
+            &sha256_file(&initrd)?,
+        );
+    }
+    if roothash_file.is_file() {
+        let recorded = std::fs::read_to_string(&roothash_file)?.trim().to_string();
+        check_field(
+            "rootfs_roothash",
+            inputs.get("rootfs_roothash").and_then(|v| v.as_str()),
+            &recorded,
+        );
+    }
+
+    for disk in &config.verity_disks {
+        let p = output.join(format!("{}.roothash", disk.name));
+        if p.is_file() {
+            let rh = std::fs::read_to_string(&p)?.trim().to_string();
+            // Manifest uses singular field names ("model_roothash") regardless
+            // of disk.name plurality. Try both so verify is forgiving.
+            let key_exact = format!("{}_roothash", disk.name);
+            let key_singular = format!(
+                "{}_roothash",
+                disk.name.strip_suffix('s').unwrap_or(&disk.name)
+            );
+            let claimed = inputs
+                .get(&key_exact)
+                .or_else(|| inputs.get(&key_singular))
+                .and_then(|v| v.as_str());
+            if claimed.is_some() {
+                check_field(&format!("{}_roothash", disk.name), claimed, &rh);
+            } else {
+                println!("  SKIP {}_roothash (not in manifest)", disk.name);
+            }
+        }
+    }
+
+    // OVMF: hash whatever the cvm.toml [manifest.snp].ovmf_file points at.
+    if let Some(ref ovmf) = config.manifest.snp.ovmf_file {
+        let p = std::path::Path::new(ovmf);
+        if p.is_file() {
+            check_field(
+                "ovmf_sha256",
+                inputs.get("ovmf_sha256").and_then(|v| v.as_str()),
+                &sha256_file(p)?,
+            );
+        }
+    }
+
+    // Recompute SNP/TDX measurements from kernel/initrd/cmdline.
+    if raw.is_file() && kernel.is_file() && initrd.is_file() {
+        let rootfs_roothash = std::fs::read_to_string(&roothash_file)?.trim().to_string();
+        let mut disk_tuples = Vec::new();
+        for disk in &config.verity_disks {
+            let rh_path = output.join(format!("{}.roothash", disk.name));
+            let ho_path = output.join(format!("{}.hashoffset", disk.name));
+            if rh_path.exists() && ho_path.exists() {
+                let rh = std::fs::read_to_string(&rh_path)?.trim().to_string();
+                let ho: u64 = std::fs::read_to_string(&ho_path)?.trim().parse()?;
+                disk_tuples.push((disk.name.clone(), rh, ho));
+            }
+        }
+        let disk_refs: Vec<(&str, &str, u64)> = disk_tuples
+            .iter()
+            .map(|(n, r, h)| (n.as_str(), r.as_str(), *h))
+            .collect();
+        let cmdline = cvmbuild_image::manifest::build_boot_cmdline(
+            &config.kernel.cmdline,
+            &rootfs_roothash,
+            &disk_refs,
+        );
+        let snp = cvmbuild_image::manifest::compute_snp_measurements(
+            config,
+            Some(&kernel),
+            Some(&initrd),
+            &cmdline,
+        );
+        let tdx = cvmbuild_image::manifest::compute_tdx_measurements(
+            config,
+            Some(&kernel),
+            Some(&initrd),
+            &cmdline,
+        );
+        for (platform, computed) in [("snp", &snp), ("tdx", &tdx)] {
+            if let Some(claimed) =
+                measurements.get(platform).and_then(|v| v.as_object())
+            {
+                for (k, v) in computed {
+                    let claimed_v = claimed.get(k).and_then(|x| x.as_str());
+                    check_field(&format!("{platform}.{k}"), claimed_v, v);
+                }
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        println!("\nVerify OK");
+        Ok(())
+    } else {
+        println!("\nVerify FAILED:");
+        for f in &failures {
+            println!("  {f}");
+        }
+        anyhow::bail!("{} field(s) drifted", failures.len())
+    }
+}
+
+/// Pure-analysis diff between two build output directories. Surfaces per-field
+/// manifest.json drift first; if `rootfs_roothash` differs, walks both
+/// squashfses and prints the file-level diff.
+fn cmd_diff(a: &std::path::Path, b: &std::path::Path) -> Result<()> {
+    let am = a.join("manifest.json");
+    let bm = b.join("manifest.json");
+    if !am.is_file() {
+        anyhow::bail!("{} not found", am.display());
+    }
+    if !bm.is_file() {
+        anyhow::bail!("{} not found", bm.display());
+    }
+    let av: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&am)?)?;
+    let bv: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&bm)?)?;
+
+    fn walk(
+        path: &str,
+        av: &serde_json::Value,
+        bv: &serde_json::Value,
+        out: &mut Vec<String>,
+    ) {
+        match (av, bv) {
+            (serde_json::Value::Object(am), serde_json::Value::Object(bm)) => {
+                let mut keys: std::collections::BTreeSet<&str> =
+                    am.keys().map(|s| s.as_str()).collect();
+                keys.extend(bm.keys().map(|s| s.as_str()));
+                for k in keys {
+                    let p = if path.is_empty() {
+                        k.to_string()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    match (am.get(k), bm.get(k)) {
+                        (Some(a), Some(b)) => walk(&p, a, b, out),
+                        (Some(_), None) => out.push(format!("- {p} (only in A)")),
+                        (None, Some(_)) => out.push(format!("+ {p} (only in B)")),
+                        _ => {}
+                    }
+                }
+            }
+            (a, b) if a == b => {}
+            (a, b) => {
+                let as_ = serde_json::to_string(a).unwrap_or_default();
+                let bs = serde_json::to_string(b).unwrap_or_default();
+                out.push(format!("~ {path}: {as_} → {bs}"));
+            }
+        }
+    }
+
+    let mut diffs = Vec::new();
+    walk("", &av, &bv, &mut diffs);
+    if diffs.is_empty() {
+        println!("manifests identical.");
+        return Ok(());
+    }
+    println!("Manifest diff ({} field(s) differ):", diffs.len());
+    for d in &diffs {
+        println!("  {d}");
+    }
+
+    let rh_changed = diffs
+        .iter()
+        .any(|d| d.contains("buildInputs.rootfs_roothash"));
+    if rh_changed {
+        let raw_a = find_raw(a)?;
+        let raw_b = find_raw(b)?;
+        match (raw_a, raw_b) {
+            (Some(ra), Some(rb)) => {
+                println!("\nrootfs squashfs diff ({} → {}):", ra.display(), rb.display());
+                if let Err(e) = print_squashfs_diff(&ra, &rb) {
+                    println!("  squashfs diff failed: {e:#}");
+                }
+            }
+            _ => {
+                println!(
+                    "\nrootfs_roothash differs but no .raw file found in one or both \
+                     output dirs — skipping squashfs diff."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Find a single `*.raw` file in a build output directory.
+fn find_raw(dir: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "raw"))
+        .collect();
+    found.sort();
+    Ok(found.into_iter().next())
+}
+
+/// Walk both squashfses and print added / removed / modified file paths.
+/// Comparison is metadata-only (type + size + symlink target + permissions);
+/// file content drift is surfaced indirectly via size mismatch in most cases,
+/// but two same-size files with different bytes will not be flagged here.
+/// That's the deliberate trade-off — content hashing every file is expensive,
+/// and the metadata-level signal is enough to investigate every case we've
+/// hit so far.
+fn print_squashfs_diff(raw_a: &std::path::Path, raw_b: &std::path::Path) -> Result<()> {
+    let map_a = squashfs_inventory(raw_a)?;
+    let map_b = squashfs_inventory(raw_b)?;
+
+    let keys_a: std::collections::BTreeSet<&String> = map_a.keys().collect();
+    let keys_b: std::collections::BTreeSet<&String> = map_b.keys().collect();
+
+    let mut added: Vec<&String> = keys_b.difference(&keys_a).copied().collect();
+    let mut removed: Vec<&String> = keys_a.difference(&keys_b).copied().collect();
+    let mut modified: Vec<(&String, &InventoryEntry, &InventoryEntry)> = keys_a
+        .intersection(&keys_b)
+        .filter_map(|k| {
+            let ea = map_a.get(*k).unwrap();
+            let eb = map_b.get(*k).unwrap();
+            if ea != eb {
+                Some((*k, ea, eb))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    added.sort();
+    removed.sort();
+    modified.sort_by(|x, y| x.0.cmp(y.0));
+
+    if added.is_empty() && removed.is_empty() && modified.is_empty() {
+        println!("  squashfs trees identical (rootfs_roothash drift must be metadata-only)");
+        return Ok(());
+    }
+
+    println!(
+        "  {} added, {} removed, {} modified",
+        added.len(),
+        removed.len(),
+        modified.len()
+    );
+    for p in &removed {
+        println!("  - {p}");
+    }
+    for p in &added {
+        println!("  + {p}");
+    }
+    for (p, ea, eb) in &modified {
+        println!("  ~ {p}: {} → {}", ea.describe(), eb.describe());
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InventoryEntry {
+    kind: &'static str, // "file" | "dir" | "symlink"
+    size: u64,
+    perms: u16,
+    target: Option<String>, // for symlinks
+}
+
+impl InventoryEntry {
+    fn describe(&self) -> String {
+        match self.kind {
+            "file" => format!("file size={} mode={:o}", self.size, self.perms),
+            "dir" => format!("dir mode={:o}", self.perms),
+            "symlink" => format!("symlink → {}", self.target.as_deref().unwrap_or("?")),
+            _ => format!("{} ?", self.kind),
+        }
+    }
+}
+
+/// Open a CVM raw image, find partition 1 (the squashfs root), parse its
+/// contents, and return path → InventoryEntry for every entry.
+fn squashfs_inventory(
+    raw_path: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, InventoryEntry>> {
+    let bytes = extract_squashfs_partition(raw_path)?;
+    let reader = cvmbuild_squashfs::reader::SquashfsReader::from_bytes(bytes)
+        .with_context(|| format!("parsing squashfs from {}", raw_path.display()))?;
+    let mut out = std::collections::BTreeMap::new();
+    reader.walk(|path, inode| {
+        let entry = match inode {
+            cvmbuild_squashfs::reader::Inode::File(f) => InventoryEntry {
+                kind: "file",
+                size: f.file_size,
+                perms: f.permissions,
+                target: None,
+            },
+            cvmbuild_squashfs::reader::Inode::Dir(d) => InventoryEntry {
+                kind: "dir",
+                size: 0,
+                perms: d.permissions,
+                target: None,
+            },
+            cvmbuild_squashfs::reader::Inode::Symlink(s) => InventoryEntry {
+                kind: "symlink",
+                size: s.target.len() as u64,
+                perms: s.permissions,
+                target: Some(s.target.clone()),
+            },
+        };
+        out.insert(path.to_string(), entry);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Extract partition 1 (squashfs root) from a CVM raw GPT disk image.
+/// Returns the raw partition bytes (may include trailing zero padding up to
+/// the 1 MiB alignment — squashfs's superblock byte_used field is what
+/// SquashfsReader actually reads from, so trailing zeros are harmless).
+fn extract_squashfs_partition(raw_path: &std::path::Path) -> Result<Vec<u8>> {
+    let mut file = std::fs::File::open(raw_path)
+        .with_context(|| format!("opening {}", raw_path.display()))?;
+    let gpt = gptman::GPT::find_from(&mut file)
+        .with_context(|| format!("parsing GPT from {}", raw_path.display()))?;
+    // Partition 1 is the squashfs root (cvmbuild-image::gpt::assemble_gpt).
+    let p1 = &gpt[1];
+    let sector = gpt.sector_size;
+    let offset = p1.starting_lba * sector;
+    let length = (p1.ending_lba - p1.starting_lba + 1) * sector;
+
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; length as usize];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 struct BootCmdOpts<'a> {

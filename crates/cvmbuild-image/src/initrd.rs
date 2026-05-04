@@ -1,19 +1,9 @@
-//! Initrd packaging — copy the dracut-produced initrd to the output dir.
+//! Initrd packaging — copy the base-image-produced initrd to the output dir.
 //!
-//! Historically cvmbuild built a CPIO overlay with verity activation
-//! scripts and prepended it to the initramfs-tools-produced base initrd.
-//! That CPIO was then byte-rewritten to zero non-deterministic fields
-//! (inode numbers, mtimes) because initramfs-tools doesn't support
-//! reproducible builds.
-//!
-//! As of cvm-base's switch to dracut (with `--reproducible`) and
-//! cvmbuild's `stage_dracut_modules` (which ships the verity-cvm dracut
-//! module from Rust assets), the initrd dracut emits at base-image build
-//! time is already deterministic and already contains our verity
-//! activation. There's nothing left to overlay or rewrite — we just copy
-//! the file and hash it.
-//!
-//! See `crates/cvmbuild-cli/assets/dracut/` for the module source.
+//! The Dockerfile's `dracut --reproducible --add 'systemd-veritysetup' …`
+//! step builds an initrd that's already deterministic and already wires
+//! systemd's stock dm-verity activation. There's nothing left to overlay
+//! or rewrite — we just copy the file and hash it.
 
 use std::path::{Path, PathBuf};
 

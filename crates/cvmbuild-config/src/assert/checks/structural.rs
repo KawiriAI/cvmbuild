@@ -443,21 +443,6 @@ pub fn struct_ovmf_path_exists(config: &Config) -> Vec<AssertionResult> {
     results
 }
 
-pub fn struct_base_image_has_dockerfile(config: &Config) -> Vec<AssertionResult> {
-    if config.image.base_image.is_some() && config.image.base_image_dockerfile.is_none() {
-        vec![AssertionResult::error(
-            "struct_base_image_has_dockerfile",
-            "image.base_image_dockerfile",
-            format!(
-                "base_image '{}' requires base_image_dockerfile to be set",
-                config.image.base_image.as_deref().unwrap()
-            ),
-        )]
-    } else {
-        vec![]
-    }
-}
-
 pub fn struct_cmdline_not_empty(config: &Config) -> Vec<AssertionResult> {
     if config.kernel.cmdline.trim().is_empty() {
         vec![AssertionResult::error(

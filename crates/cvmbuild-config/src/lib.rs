@@ -54,44 +54,51 @@ pub struct ImageConfig {
     /// If omitted, defaults to the Dockerfile's parent directory.
     #[serde(default)]
     pub context: Option<String>,
-    /// Docker image tag that this image depends on (e.g. "cvm-base:latest").
-    /// If set, cvmbuild checks whether the image exists before building.
-    /// If missing, it is auto-built from `base_image_dockerfile`.
+    /// Docker --build-arg KEY=VALUE pairs to forward to `docker buildx build`.
+    /// Distro-agnostic passthrough; cvmbuild does not interpret values.
     #[serde(default)]
-    pub base_image: Option<String>,
-    /// Dockerfile to build `base_image` from (relative to context dir).
-    /// Required when `base_image` is set.
+    pub build_args: std::collections::BTreeMap<String, String>,
+    /// Docker --secret id=ID,src=PATH entries to forward to `docker buildx
+    /// build`. `src` paths are relative to the image directory unless
+    /// absolute. Use this to thread an apt-cache URL, registry token, or
+    /// any other build-time secret into your Dockerfile via
+    /// `RUN --mount=type=secret,id=...`. cvmbuild only validates that the
+    /// source file exists.
     #[serde(default)]
-    pub base_image_dockerfile: Option<String>,
-    /// Pin to a specific kawa release. cvmbuild fetches
-    /// `kawa-v{version}-linux-x86_64.tar.gz` from the KawiriAI/kawiri
-    /// release matching this tag and stages the binary into the
-    /// base-image build context (next to `base_image_dockerfile`).
-    /// Required for reproducible measurements — kawa is COPY'd into
-    /// the rootfs and its bytes affect SNP/TDX measurements.
+    pub build_secrets: Vec<BuildSecret>,
+    /// Docker --build-context NAME=SRC entries to forward to `docker buildx
+    /// build`. Lets a Dockerfile reference an external build context by
+    /// name (`FROM <name>` or `COPY --from=<name>`) without depending on a
+    /// specific tag in the local Docker daemon. `src` is passed through to
+    /// buildx; it accepts a directory path (relative to image dir), or a
+    /// scheme-prefixed reference like `docker-image://repo:tag`,
+    /// `oci-layout:///path`, `git://...`, `https://...`. cvmbuild
+    /// validates only that local-path sources exist.
     #[serde(default)]
-    pub kawa_version: Option<String>,
-    /// Which kawa flavor to fetch from the release.
-    ///
-    /// - `None` / `"production"`: `kawa-v{version}-…` — reads real
-    ///   attestation from `/sys/kernel/config/tsm/report`. Use this for
-    ///   any image you intend clients to actually attest against.
-    /// - `"mock"`: `kawa-mocktee-v{version}-…` — returns deterministic
-    ///   fake reports. Compile-time gated, used for e2e protocol testing
-    ///   without TEE hardware. **Images built with this variant cannot
-    ///   be trusted as CVMs** — clients running real konnect will reject
-    ///   them, and the operator must explicitly configure konnect with
-    ///   a mock validator to make the handshake complete. Never publish
-    ///   such an image to production clients.
-    #[serde(default)]
-    pub kawa_variant: Option<String>,
-    /// Pin to a specific kawiri OVMF release. cvmbuild fetches
-    /// `ovmf-v{version}.tar.gz` from the KawiriAI/kawiri release matching
-    /// this tag and uses the resulting directory as the OVMF source for
-    /// measurement. Overrides whatever `--ovmf-dir` would otherwise default
-    /// to (an explicit `--ovmf-dir`/`OVMF_DIR` still wins).
-    #[serde(default)]
-    pub ovmf_version: Option<String>,
+    pub build_contexts: Vec<BuildContext>,
+}
+
+/// A BuildKit build secret to forward to `docker buildx build`.
+#[derive(Debug, Deserialize)]
+pub struct BuildSecret {
+    /// Secret ID — referenced by Dockerfile `--mount=type=secret,id=<this>`.
+    pub id: String,
+    /// Path to the secret's content on the host. Relative paths resolve
+    /// against the image directory.
+    pub src: String,
+}
+
+/// A BuildKit named build context to forward to `docker buildx build`.
+#[derive(Debug, Deserialize)]
+pub struct BuildContext {
+    /// Context name — referenced by Dockerfile `FROM <name>` or
+    /// `COPY --from=<name>`.
+    pub name: String,
+    /// Source of the context. Local paths (no `://`) are resolved against
+    /// the image directory and validated to exist. Scheme-prefixed values
+    /// (`docker-image://`, `oci-layout:///`, `git://`, `http://`,
+    /// `https://`) pass through to buildx untouched.
+    pub src: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,13 +151,22 @@ pub struct HashVerification {
 pub struct FirewallConfig {
     #[serde(default)]
     pub inbound: Vec<FirewallRule>,
+    /// "deny" (default, zero-trust) or "allow" (developer-friendly,
+    /// requires excluding the `firewall_outbound_deny` assert). Other
+    /// values are caught by the `firewall_outbound_value_valid` check.
     #[serde(default = "default_deny")]
     pub outbound: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct FirewallRule {
-    pub port: u16,
+    /// Required for tcp/udp; must be omitted for icmp/icmpv6 (those
+    /// protocols have no port number). Validation is in
+    /// `firewall_port_consistency`.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// One of "tcp", "udp", "icmp", "icmpv6". Validation is in
+    /// `firewall_proto_valid`.
     pub proto: String,
 }
 
@@ -450,7 +466,7 @@ environment_file = "/mnt/config/config.env"
         );
         assert!(config.verity.enabled);
         assert_eq!(config.security.remove.len(), 22);
-        assert_eq!(config.firewall.inbound[0].port, 8443);
+        assert_eq!(config.firewall.inbound[0].port, Some(8443));
         assert_eq!(config.verity_disks.len(), 2);
         assert_eq!(config.verity_disks[0].name, "models");
         assert_eq!(config.verity_disks[1].device, "vdc");
@@ -501,10 +517,107 @@ environment_file = "/mnt/config/config.env"
     }
 
     #[test]
-    fn outbound_allow_fails() {
+    fn outbound_allow_fails_by_default_under_production_profile() {
+        // Image authors who want outbound=allow have to explicitly
+        // exclude `firewall_outbound_deny` from the production
+        // profile. Without that exclusion, the assert tracks down
+        // open egress as a zero-trust violation.
         let toml = VALID_CONFIG.replace(r#"outbound = "deny""#, r#"outbound = "allow""#);
         let config = Config::parse(&toml).unwrap();
         let errors = config.validate();
         assert!(errors.iter().any(|e| e.message.contains("zero-trust")));
+    }
+
+    #[test]
+    fn outbound_allow_ok_when_assert_excluded() {
+        // The right knob: opt out of the catalog check, set allow.
+        // VALID_CONFIG has no [assert] block (it falls back to the
+        // production profile via Default), so we prepend a custom one
+        // that explicitly excludes the outbound-deny check.
+        let with_assert =
+            "[assert]\nprofile = \"production\"\nexclude = [\"firewall_outbound_deny\"]\n\n"
+                .to_string()
+                + VALID_CONFIG;
+        let toml = with_assert.replace(r#"outbound = "deny""#, r#"outbound = "allow""#);
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.firewall.outbound, "allow");
+        let errors = config.validate();
+        assert!(
+            errors.is_empty(),
+            "validation errors: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn outbound_unknown_value_rejected() {
+        // The new structural check catches typos / unsupported values
+        // before they reach the rule generator (which would silently
+        // fall back to deny).
+        let toml = VALID_CONFIG.replace(r#"outbound = "deny""#, r#"outbound = "yes""#);
+        let config = Config::parse(&toml).unwrap();
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("must be 'deny' or 'allow'")),
+            "expected outbound-value-valid error, got: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn icmp_inbound_no_port_ok() {
+        // ICMP rules are allowed without a port; that's the whole
+        // point of the relaxation.
+        let toml = VALID_CONFIG.replace(
+            r#"inbound = [{ port = 8443, proto = "tcp" }]"#,
+            r#"inbound = [
+{ port = 8443, proto = "tcp" },
+{ proto = "icmp" },
+]"#,
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.firewall.inbound.len(), 2);
+        assert_eq!(config.firewall.inbound[1].proto, "icmp");
+        assert_eq!(config.firewall.inbound[1].port, None);
+        let errors = config.validate();
+        assert!(
+            errors.is_empty(),
+            "icmp without port should be valid; got: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tcp_without_port_rejected() {
+        let toml = VALID_CONFIG.replace(
+            r#"inbound = [{ port = 8443, proto = "tcp" }]"#,
+            r#"inbound = [{ proto = "tcp" }]"#,
+        );
+        let config = Config::parse(&toml).unwrap();
+        let errors = config.validate();
+        assert!(
+            errors.iter().any(|e| e.message.contains("tcp rule needs a port")),
+            "expected port-required error, got: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn icmp_with_port_rejected() {
+        let toml = VALID_CONFIG.replace(
+            r#"inbound = [{ port = 8443, proto = "tcp" }]"#,
+            r#"inbound = [{ port = 0, proto = "icmp" }]"#,
+        );
+        let config = Config::parse(&toml).unwrap();
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("must not have a port")),
+            "expected icmp-no-port error, got: {:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
     }
 }

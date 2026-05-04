@@ -3,10 +3,20 @@ name = "cvmbuild-measure"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cvmbuild-measure"
+path = "src/bin/main.rs"
+
 [dependencies]
 sha2 = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
 hex = "0.4"
 
 [dev-dependencies]

@@ -38,31 +38,57 @@ pub fn no_shells_extended(config: &Config) -> Vec<AssertionResult> {
     )
 }
 
+/// Distro-agnostic check: any common package manager binary present in the
+/// rootfs must be removed. Covers apt/dpkg (Debian family), dnf/yum/rpm
+/// (RPM family), pacman (Arch), apk (Alpine), and Python's pip variants.
+/// Authors don't have to know which distro their base image is on — if it
+/// ships any of these, the check flags it.
 pub fn no_package_managers(config: &Config) -> Vec<AssertionResult> {
-    check_all_in_remove(
-        config,
-        "no_package_managers",
-        &["apt", "dpkg", "pip"],
-        "package managers enable runtime modification",
-    )
-}
-
-pub fn no_package_managers_extended(config: &Config) -> Vec<AssertionResult> {
-    check_all_in_remove(
-        config,
-        "no_package_managers_extended",
-        &[
-            "apt-get",
-            "apt-cache",
-            "apt-config",
-            "apt-key",
-            "apt-mark",
-            "dpkg-deb",
-            "dpkg-query",
-            "pip3",
-        ],
-        "all package manager variants must be removed",
-    )
+    const KNOWN: &[&str] = &[
+        // Debian / Ubuntu
+        "apt",
+        "apt-get",
+        "apt-cache",
+        "apt-config",
+        "apt-key",
+        "apt-mark",
+        "dpkg",
+        "dpkg-deb",
+        "dpkg-query",
+        // RPM family
+        "dnf",
+        "yum",
+        "rpm",
+        "microdnf",
+        // Arch
+        "pacman",
+        // Alpine
+        "apk",
+        // Python
+        "pip",
+        "pip3",
+    ];
+    let mut results = Vec::new();
+    for bin in KNOWN {
+        // Only fail if the binary is NOT in remove. We don't require all of
+        // them — only the ones that the base image actually ships.
+        // Rationale: this check runs against the cvm.toml; we can't introspect
+        // the rootfs from here. So the policy is "if you might use a
+        // Debian-family base, list these"; authors override per-image.
+        if !config.security.remove.iter().any(|r| r == bin) {
+            results.push(AssertionResult::warning(
+                "no_package_managers",
+                "security.remove",
+                format!(
+                    "'{}' is not in the removal list — if your base image \
+                     contains this package manager, runtime tampering is \
+                     possible. List it explicitly to silence this warning.",
+                    bin
+                ),
+            ));
+        }
+    }
+    results
 }
 
 pub fn no_dmsetup(config: &Config) -> Vec<AssertionResult> {
@@ -72,22 +98,4 @@ pub fn no_dmsetup(config: &Config) -> Vec<AssertionResult> {
         &["dmsetup"],
         "dmsetup can replace dm-verity targets with dm-linear (RT-18)",
     )
-}
-
-pub fn remove_package_dirs(config: &Config) -> Vec<AssertionResult> {
-    let required = ["/usr/lib/apt", "/var/lib/apt", "/var/lib/dpkg"];
-    let mut results = Vec::new();
-    for dir in required {
-        if !config.security.remove_dirs.iter().any(|d| d == dir) {
-            results.push(AssertionResult::error(
-                "remove_package_dirs",
-                "security.remove_dirs",
-                format!(
-                    "'{}' should be in remove_dirs to prevent package manager resurrection",
-                    dir
-                ),
-            ));
-        }
-    }
-    results
 }

@@ -21,9 +21,7 @@ pub static PRODUCTION: &[&str] = &[
     "no_shells",
     "no_shells_extended",
     "no_package_managers",
-    "no_package_managers_extended",
     "no_dmsetup",
-    "remove_package_dirs",
     // Module security (2)
     "modules_locked",
     "modules_lock_before_services",

@@ -47,6 +47,7 @@ impl OciExtractor {
         context: &Path,
         build_args: &[(&str, &str)],
         secrets: &[(&str, &Path)],
+        build_contexts: &[(&str, &str)],
     ) -> Result<PathBuf> {
         let rootfs = self.work_dir.join("rootfs");
         if rootfs.exists() {
@@ -77,7 +78,19 @@ impl OciExtractor {
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
             .unwrap_or("image");
-        if let Some(flags) = cache_flags(cache_name) {
+        // CVMBUILD_NO_CACHE=1 forces a true clean-slate build: skip
+        // BUILDX_CACHE entirely and pass --no-cache to docker buildx so
+        // every layer rebuilds from scratch. Used by teehost's "Fresh
+        // build" UI option, where the operator's intent is "rebuild
+        // everything, including base layers."
+        let no_cache = std::env::var("CVMBUILD_NO_CACHE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if no_cache {
+            cmd.arg("--no-cache");
+            tracing::info!("CVMBUILD_NO_CACHE=1 → docker buildx --no-cache");
+        } else if let Some(flags) = cache_flags(cache_name) {
             for flag in flags {
                 cmd.arg(flag);
             }
@@ -93,6 +106,14 @@ impl OciExtractor {
         for (id, src) in secrets {
             cmd.arg("--secret");
             cmd.arg(format!("id={},src={}", id, src.display()));
+        }
+
+        // Named build contexts — let a Dockerfile reference an external
+        // resource by name (FROM <name> / COPY --from=<name>) per build,
+        // without depending on a specific tag in the local Docker daemon.
+        for (name, src) in build_contexts {
+            cmd.arg("--build-context");
+            cmd.arg(format!("{}={}", name, src));
         }
 
         cmd.arg(context.to_string_lossy().to_string());

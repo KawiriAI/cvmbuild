@@ -25,15 +25,21 @@ pub static STRUCTURAL_CHECKS: &[CheckInfo] = &[
     // Firewall structural
     CheckInfo {
         name: "firewall_proto_valid",
-        description: "firewall protocol is tcp or udp",
+        description: "firewall protocol is tcp, udp, icmp, or icmpv6",
         category: Category::Structural,
         check: checks::firewall::firewall_proto_valid,
     },
     CheckInfo {
-        name: "firewall_port_nonzero",
-        description: "firewall port is > 0",
+        name: "firewall_port_consistency",
+        description: "tcp/udp rules carry a port; icmp rules do not",
         category: Category::Structural,
-        check: checks::firewall::firewall_port_nonzero,
+        check: checks::firewall::firewall_port_consistency,
+    },
+    CheckInfo {
+        name: "firewall_outbound_value_valid",
+        description: "outbound is one of 'deny' or 'allow'",
+        category: Category::Structural,
+        check: checks::firewall::firewall_outbound_value_valid,
     },
     // Service structural
     CheckInfo {
@@ -151,12 +157,6 @@ pub static STRUCTURAL_CHECKS: &[CheckInfo] = &[
         category: Category::Structural,
         check: checks::structural::struct_verity_disk_source_not_empty,
     },
-    CheckInfo {
-        name: "struct_base_image_has_dockerfile",
-        description: "base_image requires base_image_dockerfile",
-        category: Category::Structural,
-        check: checks::structural::struct_base_image_has_dockerfile,
-    },
 ];
 
 /// Catalog checks — opt-in via [assert] section.
@@ -268,27 +268,15 @@ pub static CATALOG_CHECKS: &[CheckInfo] = &[
     },
     CheckInfo {
         name: "no_package_managers",
-        description: "apt/dpkg/pip removed",
+        description: "common pkg managers (apt/dnf/pacman/apk/pip) listed in security.remove",
         category: Category::BinaryRemoval,
         check: checks::binary::no_package_managers,
-    },
-    CheckInfo {
-        name: "no_package_managers_extended",
-        description: "all package manager variants removed",
-        category: Category::BinaryRemoval,
-        check: checks::binary::no_package_managers_extended,
     },
     CheckInfo {
         name: "no_dmsetup",
         description: "dmsetup removed (RT-18)",
         category: Category::BinaryRemoval,
         check: checks::binary::no_dmsetup,
-    },
-    CheckInfo {
-        name: "remove_package_dirs",
-        description: "package manager dirs removed",
-        category: Category::BinaryRemoval,
-        check: checks::binary::remove_package_dirs,
     },
     // Module security (2)
     CheckInfo {

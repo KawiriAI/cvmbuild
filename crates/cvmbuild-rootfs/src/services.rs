@@ -542,19 +542,48 @@ fn fstab_entries(_config: &Config) -> String {
 }
 
 fn nftables_conf(config: &Config) -> String {
-    // Build inbound port rules from config.firewall.inbound
+    // Build inbound rules from config.firewall.inbound. The proto
+    // determines the rule shape:
+    //   - tcp/udp: "<proto> dport <port> ct state new accept"
+    //   - icmp:    "ip protocol icmp accept"
+    //   - icmpv6:  "ip6 nexthdr icmpv6 accept"
+    // Port must be set for tcp/udp and absent for icmp/icmpv6 — enforced
+    // by `firewall_port_consistency` in cvmbuild-config validation.
     let mut inbound_rules = String::new();
     for rule in &config.firewall.inbound {
-        inbound_rules.push_str(&format!(
-            "        {} dport {} ct state new accept\n",
-            rule.proto, rule.port
-        ));
+        match rule.proto.as_str() {
+            "tcp" | "udp" => {
+                if let Some(port) = rule.port {
+                    inbound_rules.push_str(&format!(
+                        "        {} dport {} ct state new accept\n",
+                        rule.proto, port
+                    ));
+                }
+            }
+            "icmp" => inbound_rules.push_str("        ip protocol icmp accept\n"),
+            "icmpv6" => inbound_rules.push_str("        ip6 nexthdr icmpv6 accept\n"),
+            // Unknown protos are caught by `firewall_proto_valid` at
+            // validation time — silently skip here so the generator
+            // never emits a malformed line if validation is bypassed.
+            _ => {}
+        }
     }
 
     let ntp_addrs = if config.services.network.ntp_servers.is_empty() {
         "162.159.200.1, 162.159.200.123".to_string()
     } else {
         config.services.network.ntp_servers.join(", ")
+    };
+
+    // Outbound: "deny" (default, zero-trust) keeps the strict policy
+    // drop chain with lo + established + NTP. "allow" replaces it
+    // with policy=accept — image authors who want this opt out of
+    // the `firewall_outbound_deny` assert (see cvm.toml [assert]).
+    let output_chain = match config.firewall.outbound.as_str() {
+        "allow" => "    chain output {\n        type filter hook output priority 0; policy accept;\n    }\n".to_string(),
+        _ => format!(
+            "    chain output {{\n        type filter hook output priority 0; policy drop;\n        oif \"lo\" accept\n        ct state established,related accept\n        ip daddr {{ {ntp_addrs} }} udp dport 123 accept\n    }}\n"
+        ),
     };
 
     format!(
@@ -574,13 +603,7 @@ table inet filter {{
         type filter hook forward priority 0; policy drop;
     }}
 
-    chain output {{
-        type filter hook output priority 0; policy drop;
-        oif \"lo\" accept
-        ct state established,related accept
-        ip daddr {{ {ntp_addrs} }} udp dport 123 accept
-    }}
-}}
+{output_chain}}}
 "
     )
 }
@@ -909,7 +932,59 @@ device_allow = ["/dev/sev-guest rw"]
         let nft = nftables_conf(&config);
         assert!(nft.contains("tcp dport 8443"));
         assert!(nft.contains("1.2.3.4"));
-        assert!(nft.contains("policy drop"));
+        // Default outbound is "deny" → policy drop on output, plus
+        // the explicit NTP allow rule for time sync.
+        assert!(nft.contains("type filter hook output priority 0; policy drop"));
+        assert!(nft.contains("udp dport 123 accept"));
+    }
+
+    #[test]
+    fn nftables_emits_icmp_input_rule() {
+        let mut config = test_config();
+        config.firewall.inbound.push(cvmbuild_config::FirewallRule {
+            port: None,
+            proto: "icmp".into(),
+        });
+        let nft = nftables_conf(&config);
+        // ICMP rule format is intentional — we anchor on it to catch
+        // accidental drift to e.g. `meta l4proto icmp` which behaves
+        // differently for fragmented packets.
+        assert!(
+            nft.contains("ip protocol icmp accept"),
+            "missing icmp rule:\n{nft}"
+        );
+    }
+
+    #[test]
+    fn nftables_emits_icmpv6_input_rule() {
+        let mut config = test_config();
+        config.firewall.inbound.push(cvmbuild_config::FirewallRule {
+            port: None,
+            proto: "icmpv6".into(),
+        });
+        let nft = nftables_conf(&config);
+        assert!(
+            nft.contains("ip6 nexthdr icmpv6 accept"),
+            "missing icmpv6 rule:\n{nft}"
+        );
+    }
+
+    #[test]
+    fn nftables_outbound_allow_uses_policy_accept() {
+        let mut config = test_config();
+        config.firewall.outbound = "allow".into();
+        let nft = nftables_conf(&config);
+        // Output chain switches from drop+rules to a single
+        // policy=accept. NTP allow line goes away — superfluous
+        // when everything's accepted.
+        assert!(
+            nft.contains("type filter hook output priority 0; policy accept"),
+            "expected output policy=accept in:\n{nft}"
+        );
+        assert!(
+            !nft.contains("udp dport 123 accept"),
+            "didn't expect NTP-specific rule with outbound=allow:\n{nft}"
+        );
     }
 
     #[test]

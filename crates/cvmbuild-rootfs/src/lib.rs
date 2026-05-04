@@ -32,7 +32,6 @@ impl RootfsBuilder {
         self.strip_suid_sgid()?;
         self.rewrite_shells_to_nologin()?;
         self.write_tee_modules_load()?;
-        self.purge_build_logs()?;
         self.apply_hardening(config)?;
         Ok(())
     }
@@ -373,64 +372,6 @@ impl RootfsBuilder {
     // -----------------------------------------------------------------------
     // Existing hardening
     // -----------------------------------------------------------------------
-
-    /// Remove build-time log files whose contents embed wallclock timestamps
-    /// from the docker build. Without this, two hosts building the same image
-    /// produce different rootfs hashes (and therefore different SNP launch
-    /// digests) purely because apt/dpkg ran at different seconds.
-    ///
-    /// Files cleared: /var/log/{apt/{history,term,eipp.log.xz},dpkg.log,
-    /// alternatives.log,bootstrap.log}. The rootfs is read-only at runtime
-    /// so dpkg/apt never run again — these logs serve no purpose in a sealed
-    /// CVM image.
-    fn purge_build_logs(&self) -> Result<()> {
-        // apt/dpkg logs — wallclock embedded in contents.
-        let log_targets = [
-            "var/log/apt/history.log",
-            "var/log/apt/term.log",
-            "var/log/apt/eipp.log.xz",
-            "var/log/dpkg.log",
-            "var/log/alternatives.log",
-            "var/log/bootstrap.log",
-        ];
-        // ld.so cache: regenerated post-install by ldconfig with non-deterministic
-        // library scan ordering (one library, one binary differing by mtime
-        // skew, and you get a different byte string). Regenerated on demand
-        // at first boot, so safe to remove.
-        //
-        // /etc/apt/sources.list: cvmbuild's embedded apt-cache proxy binds to
-        // an ephemeral port at startup (`AptCacheProxy::start`), and that
-        // port number ends up baked into sources.list via ${APT_MIRROR}.
-        // Two consecutive cold-cache builds on the same host produce
-        // different ports → different sources.list → different rootfs_roothash.
-        // Apt itself is removed from sealed CVM images (per cvm.toml security
-        // policy), so sources.list is dead weight at runtime — wipe it.
-        //
-        // /var/lib/dbus/machine-id: D-Bus generates its own random 128-bit
-        // UUID at install time. We already blank /etc/machine-id in the
-        // base-image Dockerfile, but the dbus copy is independent and gets
-        // a different UUID every cold-cache build. systemd recreates it
-        // (or symlinks to /etc/machine-id) at first boot, so safe to wipe.
-        let cache_targets = [
-            "etc/ld.so.cache",
-            "var/cache/ldconfig/aux-cache",
-            "etc/apt/sources.list",
-            "var/lib/dbus/machine-id",
-        ];
-        let mut removed = 0;
-        for rel in log_targets.iter().chain(cache_targets.iter()) {
-            let p = self.rootfs.join(rel);
-            if p.exists() {
-                std::fs::remove_file(&p)
-                    .with_context(|| format!("removing {}", p.display()))?;
-                removed += 1;
-            }
-        }
-        tracing::info!(
-            "Purged {removed} non-reproducible file(s) (apt/dpkg logs + ldconfig caches)"
-        );
-        Ok(())
-    }
 
     /// Apply security hardening: sysctl, journald config, etc.
     fn apply_hardening(&self, config: &Config) -> Result<()> {
