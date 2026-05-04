@@ -609,6 +609,22 @@ table inet filter {{
 }
 
 fn networkd_conf() -> String {
+    // DHCP=yes lets us absorb whichever IP the host management plane
+    // hands out (UserMode SLIRP, Bridged + per-tap DHCP, or a real
+    // Hetzner additional via teehost's DHCP option 121). UseDNS=yes so
+    // the VM picks up DNS servers from the same DHCP exchange — without
+    // it, /etc/resolv.conf stays empty and `curl github.com` fails even
+    // though TCP egress is open. UseNTP/UseHostname stay off because
+    // we don't want random DHCP-supplied NTP servers (we have explicit
+    // NTP in [services.network]) or a hostname change at boot (the
+    // cvm.toml's `[image].id` is the canonical name).
+    //
+    // Caveat for paranoid setups: trusting DHCP-supplied DNS means a
+    // hostile DHCP server could redirect DNS queries to a server it
+    // controls. Inference images mitigate this with `outbound = "deny"`
+    // (the firewall blocks egress to UDP/53 anyway). For
+    // outbound=allow images, the operator implicitly trusts the host
+    // management plane that runs the DHCP server.
     "\
 [Match]
 Name=en*
@@ -619,7 +635,7 @@ IPv6AcceptRA=no
 LinkLocalAddressing=no
 
 [DHCPv4]
-UseDNS=no
+UseDNS=yes
 UseNTP=no
 UseHostname=no
 "
