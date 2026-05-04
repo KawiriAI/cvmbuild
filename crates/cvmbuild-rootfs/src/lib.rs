@@ -492,20 +492,30 @@ fn strip_suid_recursive(dir: &Path, count: &mut u32) -> Result<()> {
 
 /// Validate generated nftables rules for security.
 ///
-/// The port-22 / port-80 checks are default-secure backstops for chat-only
-/// CVMs that should never expose SSH or plain HTTP. Images that legitimately
-/// want one or the other (e.g. an SSH-CVM) opt out via the matching catalog
-/// check name in `[assert].exclude`:
+/// Default-secure backstops for chat-only CVMs that should never relax
+/// each posture. Images that legitimately need one of these openings
+/// (e.g. an SSH-CVM) opt out via the matching catalog check name in
+/// `[assert].exclude`:
 ///   - `firewall_no_ssh`        → skip the port-22 check
 ///   - `firewall_no_http_plain` → skip the port-80 check
+///   - `firewall_outbound_deny` → skip the "outbound must be deny" check
+///                                AND the "all chains must drop" check
+///                                (with outbound=allow the output chain
+///                                deliberately uses policy=accept).
 fn validate_nftables(rules: &str, config: &Config) -> Result<()> {
     let mut errors = Vec::new();
     let excluded: &[String] = &config.assert.exclude;
+    let outbound_open = excluded.iter().any(|s| s == "firewall_outbound_deny");
 
-    // All chains must have policy drop
-    let chain_count = rules.matches("policy drop").count();
-    if chain_count < 3 {
-        errors.push("not all chains have 'policy drop'".to_string());
+    // All chains must have policy drop, UNLESS the operator opted out of
+    // outbound=deny (in which case the output chain uses policy=accept on
+    // purpose — input + forward still drop).
+    let drop_count = rules.matches("policy drop").count();
+    let required_drops = if outbound_open { 2 } else { 3 };
+    if drop_count < required_drops {
+        errors.push(format!(
+            "expected {required_drops} chain(s) with 'policy drop', got {drop_count}"
+        ));
     }
 
     // No SSH allowed (unless explicitly opted in via [assert].exclude).
@@ -522,8 +532,10 @@ fn validate_nftables(rules: &str, config: &Config) -> Result<()> {
         errors.push("plain HTTP (port 80) must not be allowed".to_string());
     }
 
-    // Outbound must be deny
-    if config.firewall.outbound != "deny" {
+    // Outbound must be deny unless the image explicitly opts out via
+    // `[assert].exclude = ["firewall_outbound_deny"]`. Same gate as
+    // the catalog-level check; this is the post-generation enforcement.
+    if config.firewall.outbound != "deny" && !outbound_open {
         errors.push("outbound firewall policy must be 'deny'".to_string());
     }
 
