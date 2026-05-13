@@ -60,7 +60,10 @@ enum Commands {
         guest_features: u64,
         /// Comma-separated list of NAME=HEXSIG pairs. Defaults to the four
         /// EPYC generations cvmbuild ships by default.
-        #[arg(long, default_value = "EPYC-v4=0x800F12,EPYC-Rome=0x830F10,EPYC-Milan=0xA00F11,EPYC-Genoa=0xA10F11")]
+        #[arg(
+            long,
+            default_value = "EPYC-v4=0x800F12,EPYC-Rome=0x830F10,EPYC-Milan=0xA00F11,EPYC-Genoa=0xA10F11"
+        )]
         cpu_sigs: String,
     },
     /// Compute Intel TDX MRTD + RTMR0..3.
@@ -113,16 +116,16 @@ fn run(cli: Cli) -> Result<()> {
             guest_features,
             cpu_sigs,
         } => {
-            let kernel_data = std::fs::read(&kernel)
-                .with_context(|| format!("reading {}", kernel.display()))?;
-            let initrd_data = std::fs::read(&initrd)
-                .with_context(|| format!("reading {}", initrd.display()))?;
+            let kernel_data =
+                std::fs::read(&kernel).with_context(|| format!("reading {}", kernel.display()))?;
+            let initrd_data =
+                std::fs::read(&initrd).with_context(|| format!("reading {}", initrd.display()))?;
 
             let mut out = serde_json::Map::new();
             for entry in cpu_sigs.split(',').filter(|s| !s.is_empty()) {
-                let (name, sig_str) = entry.split_once('=').with_context(|| {
-                    format!("--cpu-sigs entry '{entry}' must be NAME=0xHEX")
-                })?;
+                let (name, sig_str) = entry
+                    .split_once('=')
+                    .with_context(|| format!("--cpu-sigs entry '{entry}' must be NAME=0xHEX"))?;
                 let sig_str = sig_str.trim_start_matches("0x");
                 let vcpu_sig = u32::from_str_radix(sig_str, 16)
                     .with_context(|| format!("parsing vcpu_sig hex from '{entry}'"))?;
@@ -156,14 +159,14 @@ fn run(cli: Cli) -> Result<()> {
             cmdline,
             dsdt,
         } => {
-            let firmware = std::fs::read(&ovmf)
-                .with_context(|| format!("reading {}", ovmf.display()))?;
-            let kernel_data = std::fs::read(&kernel)
-                .with_context(|| format!("reading {}", kernel.display()))?;
-            let initrd_data = std::fs::read(&initrd)
-                .with_context(|| format!("reading {}", initrd.display()))?;
-            let dsdt_data = std::fs::read(&dsdt)
-                .with_context(|| format!("reading {}", dsdt.display()))?;
+            let firmware =
+                std::fs::read(&ovmf).with_context(|| format!("reading {}", ovmf.display()))?;
+            let kernel_data =
+                std::fs::read(&kernel).with_context(|| format!("reading {}", kernel.display()))?;
+            let initrd_data =
+                std::fs::read(&initrd).with_context(|| format!("reading {}", initrd.display()))?;
+            let dsdt_data =
+                std::fs::read(&dsdt).with_context(|| format!("reading {}", dsdt.display()))?;
 
             let mrtd = calculate_mrtd(&firmware)?;
             let rtmr0 = calc_rtmr0(&firmware, &dsdt_data, GpuModel::None)?;

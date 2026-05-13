@@ -17,8 +17,13 @@ pub fn build_initrd(
     output_path: &Path,
     _config: &cvmbuild_config::Config,
 ) -> Result<(PathBuf, String)> {
-    std::fs::copy(base_initrd, output_path)
-        .with_context(|| format!("copying {} → {}", base_initrd.display(), output_path.display()))?;
+    std::fs::copy(base_initrd, output_path).with_context(|| {
+        format!(
+            "copying {} → {}",
+            base_initrd.display(),
+            output_path.display()
+        )
+    })?;
     let hash = sha256_file(output_path)?;
     Ok((output_path.to_path_buf(), hash))
 }

@@ -598,7 +598,9 @@ environment_file = "/mnt/config/config.env"
         let config = Config::parse(&toml).unwrap();
         let errors = config.validate();
         assert!(
-            errors.iter().any(|e| e.message.contains("tcp rule needs a port")),
+            errors
+                .iter()
+                .any(|e| e.message.contains("tcp rule needs a port")),
             "expected port-required error, got: {:?}",
             errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );

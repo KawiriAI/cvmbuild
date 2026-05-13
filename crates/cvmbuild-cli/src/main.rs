@@ -1400,7 +1400,11 @@ fn cmd_verify(
     if !manifest_path.exists() {
         anyhow::bail!("{} not found", manifest_path.display());
     }
-    println!("Verifying artifacts in {} against {}", output.display(), manifest_path.display());
+    println!(
+        "Verifying artifacts in {} against {}",
+        output.display(),
+        manifest_path.display()
+    );
     let manifest_text = std::fs::read_to_string(&manifest_path)?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest_text)?;
     let inputs = manifest
@@ -1417,12 +1421,10 @@ fn cmd_verify(
 
     let name = format!("{}_{}", config.image.id, config.image.version);
     let mut failures: Vec<String> = Vec::new();
-    let mut check_field = |label: &str, claimed: Option<&str>, actual: &str| {
-        match claimed {
-            Some(c) if c == actual => println!("  OK   {label} = {actual}"),
-            Some(c) => failures.push(format!("{label}: manifest={c} actual={actual}")),
-            None => failures.push(format!("{label}: missing in manifest")),
-        }
+    let mut check_field = |label: &str, claimed: Option<&str>, actual: &str| match claimed {
+        Some(c) if c == actual => println!("  OK   {label} = {actual}"),
+        Some(c) => failures.push(format!("{label}: manifest={c} actual={actual}")),
+        None => failures.push(format!("{label}: missing in manifest")),
     };
 
     let kernel = output.join(format!("{name}.vmlinuz"));
@@ -1523,9 +1525,7 @@ fn cmd_verify(
             &cmdline,
         );
         for (platform, computed) in [("snp", &snp), ("tdx", &tdx)] {
-            if let Some(claimed) =
-                measurements.get(platform).and_then(|v| v.as_object())
-            {
+            if let Some(claimed) = measurements.get(platform).and_then(|v| v.as_object()) {
                 for (k, v) in computed {
                     let claimed_v = claimed.get(k).and_then(|x| x.as_str());
                     check_field(&format!("{platform}.{k}"), claimed_v, v);
@@ -1561,12 +1561,7 @@ fn cmd_diff(a: &std::path::Path, b: &std::path::Path) -> Result<()> {
     let av: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&am)?)?;
     let bv: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&bm)?)?;
 
-    fn walk(
-        path: &str,
-        av: &serde_json::Value,
-        bv: &serde_json::Value,
-        out: &mut Vec<String>,
-    ) {
+    fn walk(path: &str, av: &serde_json::Value, bv: &serde_json::Value, out: &mut Vec<String>) {
         match (av, bv) {
             (serde_json::Value::Object(am), serde_json::Value::Object(bm)) => {
                 let mut keys: std::collections::BTreeSet<&str> =
@@ -1614,7 +1609,11 @@ fn cmd_diff(a: &std::path::Path, b: &std::path::Path) -> Result<()> {
         let raw_b = find_raw(b)?;
         match (raw_a, raw_b) {
             (Some(ra), Some(rb)) => {
-                println!("\nrootfs squashfs diff ({} → {}):", ra.display(), rb.display());
+                println!(
+                    "\nrootfs squashfs diff ({} → {}):",
+                    ra.display(),
+                    rb.display()
+                );
                 if let Err(e) = print_squashfs_diff(&ra, &rb) {
                     println!("  squashfs diff failed: {e:#}");
                 }
@@ -1760,8 +1759,8 @@ fn squashfs_inventory(
 /// the 1 MiB alignment — squashfs's superblock byte_used field is what
 /// SquashfsReader actually reads from, so trailing zeros are harmless).
 fn extract_squashfs_partition(raw_path: &std::path::Path) -> Result<Vec<u8>> {
-    let mut file = std::fs::File::open(raw_path)
-        .with_context(|| format!("opening {}", raw_path.display()))?;
+    let mut file =
+        std::fs::File::open(raw_path).with_context(|| format!("opening {}", raw_path.display()))?;
     let gpt = gptman::GPT::find_from(&mut file)
         .with_context(|| format!("parsing GPT from {}", raw_path.display()))?;
     // Partition 1 is the squashfs root (cvmbuild-image::gpt::assemble_gpt).

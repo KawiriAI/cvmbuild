@@ -499,9 +499,9 @@ fn strip_suid_recursive(dir: &Path, count: &mut u32) -> Result<()> {
 ///   - `firewall_no_ssh`        → skip the port-22 check
 ///   - `firewall_no_http_plain` → skip the port-80 check
 ///   - `firewall_outbound_deny` → skip the "outbound must be deny" check
-///                                AND the "all chains must drop" check
-///                                (with outbound=allow the output chain
-///                                deliberately uses policy=accept).
+///     AND the "all chains must drop" check
+///     (with outbound=allow the output chain
+///     deliberately uses policy=accept).
 fn validate_nftables(rules: &str, config: &Config) -> Result<()> {
     let mut errors = Vec::new();
     let excluded: &[String] = &config.assert.exclude;
